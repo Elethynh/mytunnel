@@ -30,7 +30,7 @@ const defaultRouterPort = 43187
 func normalizeSubdomain(value string) (string, error) {
 	value = strings.ToLower(value)
 	if !dnsLabel.MatchString(value) {
-		return "", errors.New("subdomena musi być pojedynczą etykietą DNS (litery, cyfry, myślniki)")
+		return "", errors.New("the subdomain must be a single DNS label (letters, digits and hyphens)")
 	}
 	return value, nil
 }
@@ -38,15 +38,15 @@ func normalizeSubdomain(value string) (string, error) {
 func normalizeDomain(value string) (string, error) {
 	value = strings.ToLower(value)
 	if len(value) > 253 || strings.ContainsAny(value, " \t\n\r/:*") {
-		return "", errors.New("niepoprawna domena")
+		return "", errors.New("invalid domain")
 	}
 	parts := strings.Split(value, ".")
 	if len(parts) < 2 {
-		return "", errors.New("niepoprawna domena")
+		return "", errors.New("invalid domain")
 	}
 	for _, part := range parts {
 		if !dnsLabel.MatchString(part) {
-			return "", errors.New("niepoprawna domena; użyj nazwy ASCII lub punycode")
+			return "", errors.New("invalid domain; use ASCII or punycode")
 		}
 	}
 	return value, nil
@@ -54,16 +54,16 @@ func normalizeDomain(value string) (string, error) {
 
 func parsePort(value string) (int, error) {
 	if value == "" {
-		return 0, errors.New("port musi być liczbą od 1 do 65535")
+		return 0, errors.New("the port must be an integer from 1 to 65535")
 	}
 	for _, char := range value {
 		if char < '0' || char > '9' {
-			return 0, errors.New("port musi być liczbą od 1 do 65535")
+			return 0, errors.New("the port must be an integer from 1 to 65535")
 		}
 	}
 	port, err := strconv.Atoi(value)
 	if err != nil || port < 1 || port > 65535 {
-		return 0, errors.New("port musi być liczbą od 1 do 65535")
+		return 0, errors.New("the port must be an integer from 1 to 65535")
 	}
 	return port, nil
 }
@@ -132,7 +132,7 @@ func loadSettings() (Settings, string, error) {
 	}
 	_, tokenErr := hex.DecodeString(settings.Token)
 	if len(settings.Token) != 64 || tokenErr != nil || settings.RouterPort < 1 || settings.RouterPort > 65535 {
-		return Settings{}, "", errors.New("uszkodzony plik ustawień")
+		return Settings{}, "", errors.New("invalid settings file")
 	}
 	if settings.Domain != "" {
 		settings.Domain, err = normalizeDomain(settings.Domain)
@@ -195,13 +195,13 @@ func renderCloudflaredConfig(settings Settings) (string, error) {
 		return "", err
 	}
 	if !tunnelUUID.MatchString(settings.Tunnel) {
-		return "", errors.New("tunel musi mieć poprawny UUID")
+		return "", errors.New("the tunnel must have a valid UUID")
 	}
 	if !filepath.IsAbs(settings.Credentials) {
-		return "", errors.New("ścieżka credentials musi być absolutna")
+		return "", errors.New("the credentials path must be absolute")
 	}
 	if settings.RouterPort < 1 || settings.RouterPort > 65535 {
-		return "", errors.New("niepoprawny port routera")
+		return "", errors.New("invalid router port")
 	}
 	return fmt.Sprintf("tunnel: %s\ncredentials-file: %s\ningress:\n  - hostname: %s\n    service: %s\n  - service: http_status:404\n",
 		strconv.Quote(settings.Tunnel), strconv.Quote(settings.Credentials),

@@ -52,7 +52,7 @@ func newRouteTarget(port int) *routeTarget {
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	proxy.Transport = transport
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-		http.Error(w, "Usługa lokalna nie odpowiada.", http.StatusBadGateway)
+		http.Error(w, "The local service is not responding.", http.StatusBadGateway)
 	}
 	return &routeTarget{port: port, proxy: proxy}
 }
@@ -93,7 +93,7 @@ func listenControl(path string) (net.Listener, error) {
 		probe, dialErr := net.DialTimeout("unix", path, 200*time.Millisecond)
 		if dialErr == nil {
 			probe.Close()
-			return nil, errors.New("lokalny proces już działa")
+			return nil, errors.New("the local daemon is already running")
 		}
 		if errors.Is(dialErr, syscall.ECONNREFUSED) {
 			if removeErr := os.Remove(path); removeErr != nil {
@@ -159,7 +159,7 @@ func (d *Daemon) routeFor(host string) (*routeTarget, bool) {
 func (d *Daemon) proxy(w http.ResponseWriter, r *http.Request) {
 	target, found := d.routeFor(r.Host)
 	if !found {
-		http.Error(w, "Nieaktywna subdomena.", http.StatusNotFound)
+		http.Error(w, "This subdomain is not active.", http.StatusNotFound)
 		return
 	}
 	target.proxy.ServeHTTP(w, r)
@@ -200,12 +200,12 @@ func (d *Daemon) handleControl(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	line, err := bufio.NewReader(io.LimitReader(conn, 4097)).ReadBytes('\n')
 	if err != nil || len(line) > 4096 {
-		d.reply(conn, controlResponse{Error: "Niepoprawna komenda."})
+		d.reply(conn, controlResponse{Error: "Invalid command."})
 		return
 	}
 	var request controlRequest
 	if json.Unmarshal(line, &request) != nil || subtle.ConstantTimeCompare([]byte(request.Token), []byte(d.settings.Token)) != 1 {
-		d.reply(conn, controlResponse{Error: "Brak dostępu do lokalnego procesu."})
+		d.reply(conn, controlResponse{Error: "Access to the local daemon was denied."})
 		return
 	}
 	if request.Type == controlStatus {
@@ -220,12 +220,12 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		return
 	}
 	if request.Type != controlRegister {
-		d.reply(conn, controlResponse{Error: "Nieznana komenda."})
+		d.reply(conn, controlResponse{Error: "Unknown command."})
 		return
 	}
 	name, err := normalizeSubdomain(request.Subdomain)
 	if err == nil && (request.Port < 1 || request.Port > 65535) {
-		err = errors.New("niepoprawny port")
+		err = errors.New("invalid port")
 	}
 	if err != nil {
 		d.reply(conn, controlResponse{Error: err.Error()})
@@ -234,17 +234,17 @@ func (d *Daemon) handleControl(conn net.Conn) {
 	d.mu.Lock()
 	if d.stopping || d.closed {
 		d.mu.Unlock()
-		d.reply(conn, controlResponse{Error: "Proces kończy pracę.", Retry: true})
+		d.reply(conn, controlResponse{Error: "The daemon is shutting down.", Retry: true})
 		return
 	}
 	if _, exists := d.routes[name]; exists {
 		d.mu.Unlock()
-		d.reply(conn, controlResponse{Error: "Subdomena " + name + " jest już zajęta."})
+		d.reply(conn, controlResponse{Error: "Subdomain " + name + " is already in use."})
 		return
 	}
 	if request.Port == d.RouterPort {
 		d.mu.Unlock()
-		d.reply(conn, controlResponse{Error: "Nie można przekierować portu routera na samego siebie."})
+		d.reply(conn, controlResponse{Error: "Cannot forward the router port to itself."})
 		return
 	}
 	d.routes[name] = newRouteTarget(request.Port)

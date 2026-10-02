@@ -55,14 +55,14 @@ func sendControl(address string, request controlRequest) (controlResponse, net.C
 	if err != nil || len(line) > 4096 {
 		conn.Close()
 		if err == nil {
-			err = errors.New("zbyt długa odpowiedź procesu")
+			err = errors.New("daemon response is too long")
 		}
 		return controlResponse{}, nil, err
 	}
 	var response controlResponse
 	if err := json.Unmarshal(line, &response); err != nil {
 		conn.Close()
-		return controlResponse{}, nil, fmt.Errorf("niepoprawna odpowiedź procesu: %w", err)
+		return controlResponse{}, nil, fmt.Errorf("invalid daemon response: %w", err)
 	}
 	conn.SetDeadline(time.Time{})
 	return response, conn, nil

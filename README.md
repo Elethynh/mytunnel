@@ -1,63 +1,154 @@
 # mytunnel
 
-Małe CLI do wystawiania lokalnych usług HTTP pod różnymi subdomenami jednej domeny. Jeden proces `cloudflared` obsługuje wszystkie aktywne komendy. Subdomeny mapuje lokalny router, więc uruchomienie nowej usługi nie wymaga zmian DNS ani wywołania API Cloudflare.
+Expose local HTTP services on subdomains of your own domain with a small Go CLI and [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/).
 
-Wymaga Go 1.22 lub nowszego do zbudowania. Gotowy plik wykonywalny nie potrzebuje runtime ani zewnętrznych bibliotek. Działa na jednym komputerze z systemem Linux lub macOS.
+```sh
+mytunnel 5173 --subdomain plant
+# https://plant.example.com → 127.0.0.1:5173
+```
 
-```bash
+One computer runs one shared `cloudflared` process and a local router. Each CLI command adds a route, keeps it alive, and removes it when you press Ctrl+C. Start another command to serve another port. A single wildcard DNS record covers every route, so starting a service requires no DNS changes or Cloudflare API calls.
+
+Without a configured domain, the same commands work locally at `http://plant.localhost:43187`.
+
+## Install
+
+### Download a binary
+
+Download an archive and `checksums.txt` from the [latest release](https://github.com/Elethynh/mytunnel/releases/latest). The binary needs no Go runtime. Public tunnels also require `cloudflared`.
+
+| System | Archive suffix |
+| --- | --- |
+| Linux, x86-64 | `linux_amd64.tar.gz` |
+| Linux, ARM64 | `linux_arm64.tar.gz` |
+| macOS, Intel | `darwin_amd64.tar.gz` |
+| macOS, Apple Silicon | `darwin_arm64.tar.gz` |
+
+Check the archive's SHA-256 against `checksums.txt` using `sha256sum` on Linux or `shasum -a 256` on macOS. For example, install the Linux x86-64 release with:
+
+```sh
+tar -xzf mytunnel_0.1.0_linux_amd64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 mytunnel "$HOME/.local/bin/mytunnel"
+```
+
+Make sure `$HOME/.local/bin` is in your `PATH`. In zsh, run `rehash` if the new command is not found.
+
+### Install with Go
+
+Go 1.22 or newer is required:
+
+```sh
+go install github.com/Elethynh/mytunnel@latest
+```
+
+The command is installed in `$(go env GOPATH)/bin`, unless you set `GOBIN`. Add that directory to your `PATH`.
+
+### Build from source
+
+```sh
+git clone https://github.com/Elethynh/mytunnel.git
+cd mytunnel
 go build -o mytunnel .
 ```
 
-Możesz skopiować plik `mytunnel` do katalogu z `PATH`, żeby wywoływać go bez `./`.
+## Try it before buying a domain
 
-## Przed zakupem domeny: tryb lokalny
+Run your HTTP application, then start a route:
 
-```bash
-./mytunnel 3000 --subdomain demo
-# http://demo.localhost:43187 → 127.0.0.1:3000
+```sh
+mytunnel 5173 --subdomain plant
+# http://plant.localhost:43187 → 127.0.0.1:5173
 ```
 
-W drugim terminalu możesz uruchomić inną usługę:
+In another terminal:
 
-```bash
-./mytunnel 8080 --subdomain api
+```sh
+mytunnel 8080 --subdomain api
 # http://api.localhost:43187 → 127.0.0.1:8080
 ```
 
-Pominięcie `--subdomain` generuje losową nazwę. `./mytunnel status` pokazuje aktywne trasy. Każda komenda trzyma własną trasę do `Ctrl+C`; zerwanie połączenia również ją usuwa. Ostatnia zamknięta trasa zatrzymuje proces lokalny po kilku sekundach.
+Omit `--subdomain` to generate a random name. `mytunnel status` lists active routes, and `mytunnel --version` prints the installed version.
 
-Jeśli system nie rozwiązuje nazw `*.localhost`, sprawdź router nagłówkiem `Host`:
+Each command owns its route until Ctrl+C or a disconnected control session. Stopping one route leaves the others running. The shared daemon exits after the final route has been inactive for five seconds.
 
-```bash
-curl -H 'Host: demo.localhost' http://127.0.0.1:43187/
+If your system does not resolve `*.localhost`, send the hostname explicitly:
+
+```sh
+curl -H 'Host: plant.localhost' http://127.0.0.1:43187/
 ```
 
-## Po zakupie domeny: HTTPS przez Cloudflare
+Local mode is accessible only on your computer.
 
-1. Dodaj domenę do Cloudflare na darmowym planie i ustaw w Google Cloud Domains serwery nazw podane przez Cloudflare. Poczekaj, aż strefa będzie aktywna i certyfikat Universal SSL zostanie wydany.
-2. Zainstaluj `cloudflared` na tym komputerze. Wykonaj `cloudflared tunnel login`, potem `cloudflared tunnel create mytunnel`. Zapisz UUID tunelu i ścieżkę do wygenerowanego pliku `<UUID>.json`.
-3. Skonfiguruj CLI:
+## Set up public HTTPS
 
-   ```bash
-   ./mytunnel configure \
-     --domain example.com \
-     --tunnel 6ff42ae2-765d-4adf-8112-31c55c1551ef \
-     --credentials /pełna/ścieżka/do/6ff42ae2-765d-4adf-8112-31c55c1551ef.json
+This requires a domain, a Cloudflare account, and `cloudflared` on the computer serving your applications. The domain can be registered with Cloudflare or another registrar.
+
+1. Add the domain to Cloudflare. If another registrar manages it, change its nameservers to those assigned by Cloudflare. Wait for the zone to become active and its Universal SSL certificate to be issued.
+2. [Install cloudflared](https://developers.cloudflare.com/tunnel/downloads/), then create a locally managed tunnel:
+
+   ```sh
+   cloudflared tunnel login
+   cloudflared tunnel create mytunnel
    ```
 
-4. W Cloudflare DNS utwórz **jeden** rekord `CNAME`: nazwa `*`, cel `<UUID>.cfargotunnel.com`, status **Proxied**. Nie twórz osobnego rekordu dla każdej subdomeny.
-5. Uruchom `./mytunnel 3000 --subdomain demo`. Adres będzie miał postać `https://demo.example.com`. Trasa lokalna powstaje od razu; połączenie `cloudflared` z Cloudflare może potrzebować chwili.
+   Note the tunnel UUID and the path to its generated `<UUID>.json` credentials file.
+3. Stop any active `mytunnel` commands, then configure the domain and tunnel:
 
-Konfiguracja tunelu jest generowana z `settings.json` przy starcie lokalnego procesu: ingress `*.example.com` prowadzi do routera, a pozostałe hosty otrzymują 404. `cloudflared` uruchamia się automatycznie z pierwszą trasą. Ustawienia, prywatne gniazdo sterujące i log znajdują się w `~/.config/mytunnel/` (lub w `$XDG_CONFIG_HOME/mytunnel/`). Gniazdo i `settings.json` mają uprawnienia `0600`.
+   ```sh
+   mytunnel configure \
+     --domain example.com \
+     --tunnel 6ff42ae2-765d-4adf-8112-31c55c1551ef \
+     --credentials /absolute/path/to/6ff42ae2-765d-4adf-8112-31c55c1551ef.json
+   ```
 
-Ruch publiczny wymaga uruchomionego komputera i procesu CLI. Po jego zatrzymaniu rekord DNS pozostaje; bez aktywnego tunelu Cloudflare może zwrócić błąd 1016. Wystawione usługi są publiczne i nie mają dodatkowego logowania. Narzędzie obsługuje usługi HTTP oraz połączenia WebSocket, a nazwy tylko na pierwszym poziomie domeny.
+4. In Cloudflare DNS, create one **proxied CNAME** record: name `*`, target `<UUID>.cfargotunnel.com`. A specific DNS record takes precedence over the wildcard; remove a conflicting record if you want that hostname to reach the tunnel.
+5. Start a route:
 
-## Sprawdzenie
+   ```sh
+   mytunnel 5173 --subdomain plant
+   # https://plant.example.com → 127.0.0.1:5173
+   ```
 
-```bash
-go test ./...
+The local route is registered immediately. `cloudflared` may need a moment to connect to Cloudflare. Public HTTPS is available while your computer and CLI sessions are running. Once the tunnel stops, its DNS record remains.
+
+The router supports HTTP and WebSocket connections, and routes use one subdomain label such as `plant.example.com`. These public services have no additional authentication. Some development servers check the HTTP Host header; allow your chosen public hostname explicitly in the application's server settings.
+
+## How it works
+
+```mermaid
+flowchart LR
+    browser["Browser: plant.example.com"] --> edge["Cloudflare HTTPS"]
+    edge --> tunnel["cloudflared"]
+    tunnel --> router["Local router"]
+    router --> app["127.0.0.1:5173"]
 ```
 
-Testy obejmują dwa równoległe porty, zamknięcie pojedynczej trasy oraz routing HTTP i WebSocket. Działanie zewnętrznego `cloudflared` sprawdzono lokalnie z zastępczym procesem. Rzeczywistego DNS i połączenia z Cloudflare nie da się sprawdzić przed utworzeniem domeny i tunelu.
+The first CLI session starts the shared daemon and, in public mode, `cloudflared`. A private Unix socket registers routes and tracks their owning sessions. Requests are forwarded to the selected local port according to their hostname.
 
-Dokumentacja Cloudflare: [lokalnie zarządzany tunel](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/create-local-tunnel/), [reguły ingress](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/configuration-file/), [rekordy wildcard](https://developers.cloudflare.com/dns/manage-dns-records/reference/wildcard-dns-records/), [Universal SSL](https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/).
+Settings and daemon logs live in `~/.config/mytunnel/`, or `$XDG_CONFIG_HOME/mytunnel/`. The settings file and control socket have mode `0600`, and their directory has mode `0700`. Tunnel configuration is generated from the settings when the daemon starts. `MYTUNNEL_HOME` overrides the settings directory for development and isolated tests.
+
+## Development and releases
+
+```sh
+go test -race ./...
+go vet ./...
+go build .
+```
+
+Tests cover first-time settings creation, validation, concurrent routes, session cleanup, public hostname routing, idle shutdown, and WebSocket upgrades. Tests run on Linux and macOS in GitHub Actions. A real public tunnel needs a configured Cloudflare account and domain to test end to end.
+
+To build the four release archives and their SHA-256 checksums:
+
+```sh
+./scripts/package-release.sh v0.1.0
+# dist/v0.1.0/
+```
+
+Pushing a version tag such as `v0.1.0` runs the release workflow, repeats the checks, and publishes the archives to GitHub Releases.
+
+## License
+
+[MIT](LICENSE).
+
+Cloudflare documentation: [locally managed tunnels](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/create-local-tunnel/), [ingress rules](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/configuration-file/), [wildcard DNS](https://developers.cloudflare.com/dns/manage-dns-records/reference/wildcard-dns-records/), and [Universal SSL](https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/).

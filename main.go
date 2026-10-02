@@ -25,27 +25,34 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
-		fmt.Printf(`Użycie:
-  mytunnel <port> [--subdomain nazwa]  Udostępnij lokalną usługę HTTP
-  mytunnel status                       Pokaż aktywne trasy
-  mytunnel configure --domain domena --tunnel UUID --credentials plik.json
+		fmt.Printf(`Usage:
+  mytunnel <port> [--subdomain name]  Expose a local HTTP service
+  mytunnel status                    Show active routes
+  mytunnel --version                 Show the installed version
+  mytunnel configure --domain domain --tunnel UUID --credentials file.json
 
-Bez konfiguracji Cloudflare działa lokalnie pod <nazwa>.localhost:%d.
-Każda komenda utrzymuje swoją trasę do Ctrl+C.
+Without Cloudflare configuration, routes use <name>.localhost:%d.
+Each command keeps its route active until Ctrl+C.
 `, defaultRouterPort)
 		return nil
 	}
 	switch args[0] {
+	case "--version", "-v":
+		if len(args) != 1 {
+			return errors.New("--version does not accept arguments")
+		}
+		fmt.Println("mytunnel", buildVersion())
+		return nil
 	case "daemon":
 		if len(args) != 1 {
-			return errors.New("komenda daemon nie przyjmuje parametrów")
+			return errors.New("daemon does not accept arguments")
 		}
 		return runDaemon()
 	case "configure":
 		return configure(args[1:])
 	case "status":
 		if len(args) != 1 {
-			return errors.New("komenda status nie przyjmuje parametrów")
+			return errors.New("status does not accept arguments")
 		}
 		return status()
 	default:
@@ -60,12 +67,12 @@ func parseOptions(args []string, allowed ...string) (map[string]string, error) {
 		valid[name] = true
 	}
 	if len(args)%2 != 0 {
-		return nil, fmt.Errorf("niepoprawny parametr: %s", args[len(args)-1])
+		return nil, fmt.Errorf("invalid argument: %s", args[len(args)-1])
 	}
 	for i := 0; i < len(args); i += 2 {
 		key, value := args[i], args[i+1]
 		if !valid[key] || value == "" || strings.HasPrefix(value, "--") || result[key] != "" {
-			return nil, fmt.Errorf("niepoprawny parametr: %s", key)
+			return nil, fmt.Errorf("invalid argument: %s", key)
 		}
 		result[key] = value
 	}
@@ -93,7 +100,7 @@ func configure(args []string) error {
 		return err
 	}
 	if values["--domain"] == "" || values["--tunnel"] == "" || values["--credentials"] == "" {
-		return errors.New("podaj --domain, --tunnel i --credentials")
+		return errors.New("provide --domain, --tunnel and --credentials")
 	}
 	lock, err := lockSettingsDir()
 	if err != nil {
@@ -113,10 +120,10 @@ func configure(args []string) error {
 			break
 		}
 		if len(current.Routes) > 0 {
-			return errors.New("zatrzymaj aktywne komendy mytunnel przed zmianą konfiguracji")
+			return errors.New("stop active mytunnel commands before changing the configuration")
 		}
 		if time.Since(start) >= 5*time.Second {
-			return errors.New("lokalny proces nadal działa; spróbuj ponownie za chwilę")
+			return errors.New("the local daemon is still running; try again shortly")
 		}
 	}
 	credentials, err := filepath.Abs(values["--credentials"])
@@ -124,7 +131,7 @@ func configure(args []string) error {
 		return err
 	}
 	if _, err := os.Stat(credentials); err != nil {
-		return fmt.Errorf("nie znaleziono pliku credentials: %w", err)
+		return fmt.Errorf("credentials file not found: %w", err)
 	}
 	settings.Domain, err = normalizeDomain(values["--domain"])
 	if err != nil {
@@ -138,8 +145,8 @@ func configure(args []string) error {
 	if err := saveSettings(settings, dir); err != nil {
 		return err
 	}
-	fmt.Printf("Zapisano konfigurację dla *.%s.\n", settings.Domain)
-	fmt.Printf("Utwórz w Cloudflare proxied CNAME: * → %s.cfargotunnel.com\n", settings.Tunnel)
+	fmt.Printf("Saved configuration for *.%s.\n", settings.Domain)
+	fmt.Printf("Create a proxied CNAME in Cloudflare: * → %s.cfargotunnel.com\n", settings.Tunnel)
 	return nil
 }
 
@@ -153,11 +160,11 @@ func status() error {
 		return err
 	}
 	if current == nil {
-		fmt.Println("Lokalny proces nie działa.")
+		fmt.Println("The local daemon is not running.")
 		return nil
 	}
 	if len(current.Routes) == 0 {
-		fmt.Println("Brak aktywnych tras.")
+		fmt.Println("No active routes.")
 	}
 	for _, route := range current.Routes {
 		address := fmt.Sprintf("http://%s.localhost:%d", route.Subdomain, settings.RouterPort)
@@ -195,10 +202,10 @@ func register(settings Settings, dir, name string, port int) (controlResponse, n
 	address := controlAddress(dir)
 	if settings.Domain != "" {
 		if _, err := os.Stat(settings.Credentials); err != nil {
-			return controlResponse{}, nil, fmt.Errorf("nie znaleziono pliku credentials: %w", err)
+			return controlResponse{}, nil, fmt.Errorf("credentials file not found: %w", err)
 		}
 		if _, err := exec.LookPath("cloudflared"); err != nil {
-			return controlResponse{}, nil, errors.New("zainstaluj cloudflared i dodaj go do PATH")
+			return controlResponse{}, nil, errors.New("install cloudflared and add it to PATH")
 		}
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -222,7 +229,7 @@ func register(settings Settings, dir, name string, port int) (controlResponse, n
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return controlResponse{}, nil, fmt.Errorf("proces nie wystartował; sprawdź %s", filepath.Join(dir, "daemon.log"))
+	return controlResponse{}, nil, fmt.Errorf("the daemon did not start; check %s", filepath.Join(dir, "daemon.log"))
 }
 
 func route(args []string) error {
@@ -266,9 +273,9 @@ func route(args []string) error {
 	}
 	fmt.Printf("%s → 127.0.0.1:%d\n", response.URL, port)
 	if settings.Domain != "" {
-		fmt.Println("Cloudflare może potrzebować chwili na nawiązanie połączenia.")
+		fmt.Println("Cloudflare may need a moment to establish the connection.")
 	}
-	fmt.Println("Ctrl+C kończy tę trasę.")
+	fmt.Println("Press Ctrl+C to stop this route.")
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
@@ -278,7 +285,7 @@ func route(args []string) error {
 	case <-signals:
 		return nil
 	case <-disconnected:
-		return errors.New("połączenie z lokalnym procesem zostało przerwane")
+		return errors.New("the connection to the local daemon was interrupted")
 	}
 }
 
@@ -329,9 +336,9 @@ func runDaemon() error {
 	case <-daemon.stopCh:
 	case err := <-cloudflaredDone:
 		if err != nil {
-			result = fmt.Errorf("cloudflared zakończył pracę: %w", err)
+			result = fmt.Errorf("cloudflared exited: %w", err)
 		} else {
-			result = errors.New("cloudflared zakończył pracę")
+			result = errors.New("cloudflared exited")
 		}
 		cloudflaredDone = nil
 	}

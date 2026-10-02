@@ -18,6 +18,21 @@ func serverPort(server *httptest.Server) int {
 	return server.Listener.Addr().(*net.TCPAddr).Port
 }
 
+func socketTestDir(t *testing.T) string {
+	t.Helper()
+	// macOS temporary paths can exceed the Unix socket path length limit.
+	dir, err := os.MkdirTemp("/tmp", "mytunnel-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	return dir
+}
+
 func TestSettingsFirstUse(t *testing.T) {
 	t.Setenv("MYTUNNEL_HOME", t.TempDir())
 	first, dir, err := loadSettings()
@@ -54,7 +69,7 @@ func TestWebSocketUpgradePassesThrough(t *testing.T) {
 	defer backend.Close()
 	port := serverPort(backend)
 	settings := Settings{Token: strings.Repeat("e", 64)}
-	daemon, err := startDaemon(settings, t.TempDir(), time.Hour)
+	daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +151,7 @@ func TestDaemonRoutesAndReleasesSessions(t *testing.T) {
 	}))
 	defer two.Close()
 	settings := Settings{Token: strings.Repeat("a", 64), RouterPort: 0}
-	daemon, err := startDaemon(settings, t.TempDir(), time.Hour)
+	daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +223,7 @@ func TestPublicHostAndIdleShutdown(t *testing.T) {
 	}))
 	defer backend.Close()
 	settings := Settings{Token: strings.Repeat("b", 64), Domain: "example.com"}
-	daemon, err := startDaemon(settings, t.TempDir(), 50*time.Millisecond)
+	daemon, err := startDaemon(settings, socketTestDir(t), 50*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
