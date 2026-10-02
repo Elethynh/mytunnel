@@ -150,6 +150,13 @@ func configure(args []string) error {
 	return nil
 }
 
+func routeURL(name, domain string, routerPort int) string {
+	if domain != "" {
+		return fmt.Sprintf("https://%s.%s", name, domain)
+	}
+	return fmt.Sprintf("http://%s.localhost:%d", name, routerPort)
+}
+
 func status() error {
 	settings, dir, err := loadSettings()
 	if err != nil {
@@ -167,10 +174,7 @@ func status() error {
 		fmt.Println("No active routes.")
 	}
 	for _, route := range current.Routes {
-		address := fmt.Sprintf("http://%s.localhost:%d", route.Subdomain, settings.RouterPort)
-		if current.Domain != "" {
-			address = fmt.Sprintf("https://%s.%s", route.Subdomain, current.Domain)
-		}
+		address := routeURL(route.Subdomain, current.Domain, settings.RouterPort)
 		fmt.Printf("%s → 127.0.0.1:%d\n", address, route.Port)
 	}
 	return nil

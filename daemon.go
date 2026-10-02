@@ -14,7 +14,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -32,7 +31,6 @@ type Daemon struct {
 	idle       *time.Timer
 	idleAfter  time.Duration
 	server     *http.Server
-	router     net.Listener
 	control    net.Listener
 	stopCh     chan struct{}
 	stopOnce   sync.Once
@@ -60,25 +58,24 @@ func newRouteTarget(port int) *routeTarget {
 func startDaemon(settings Settings, dir string, idleAfter time.Duration) (*Daemon, error) {
 	d := &Daemon{
 		settings: settings, routes: make(map[string]*routeTarget), clients: make(map[net.Conn]struct{}),
-		idleAfter: idleAfter, stopCh: make(chan struct{}), socketPath: filepath.Join(dir, "control.sock"),
+		idleAfter: idleAfter, stopCh: make(chan struct{}), socketPath: controlAddress(dir),
 	}
 	d.server = &http.Server{Handler: http.HandlerFunc(d.proxy), ReadHeaderTimeout: 5 * time.Second}
-	var err error
-	d.router, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", settings.RouterPort))
+	router, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", settings.RouterPort))
 	if err != nil {
 		return nil, err
 	}
-	d.RouterPort = d.router.Addr().(*net.TCPAddr).Port
+	d.RouterPort = router.Addr().(*net.TCPAddr).Port
 	d.control, err = listenControl(d.socketPath)
 	if err != nil {
-		d.router.Close()
+		router.Close()
 		return nil, err
 	}
 	d.mu.Lock()
 	d.resetIdleLocked()
 	d.mu.Unlock()
 	go func() {
-		if err := d.server.Serve(d.router); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := d.server.Serve(router); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("router: %v", err)
 			d.signalStop()
 		}
@@ -143,10 +140,10 @@ func (d *Daemon) routeFor(host string) (*routeTarget, bool) {
 	if d.settings.Domain != "" {
 		suffix = "." + d.settings.Domain
 	}
-	if !strings.HasSuffix(host, suffix) {
+	label, matches := strings.CutSuffix(host, suffix)
+	if !matches {
 		return nil, false
 	}
-	label := strings.TrimSuffix(host, suffix)
 	if label == "" || strings.Contains(label, ".") {
 		return nil, false
 	}
@@ -251,12 +248,7 @@ func (d *Daemon) handleControl(conn net.Conn) {
 	owned = name
 	d.resetIdleLocked()
 	d.mu.Unlock()
-	host := name + ".localhost"
-	address := fmt.Sprintf("http://%s:%d", host, d.RouterPort)
-	if d.settings.Domain != "" {
-		host = name + "." + d.settings.Domain
-		address = "https://" + host
-	}
+	address := routeURL(name, d.settings.Domain, d.RouterPort)
 	if err := d.reply(conn, controlResponse{OK: true, URL: address}); err != nil {
 		return
 	}

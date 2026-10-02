@@ -82,15 +82,23 @@ func settingsDir() (string, error) {
 	return filepath.Join(home, ".config", "mytunnel"), nil
 }
 
-func loadSettings() (Settings, string, error) {
+func prepareSettingsDir() (string, error) {
 	dir, err := settingsDir()
 	if err != nil {
-		return Settings{}, "", err
+		return "", err
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return Settings{}, "", err
+		return "", err
 	}
 	if err := os.Chmod(dir, 0700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func loadSettings() (Settings, string, error) {
+	dir, err := prepareSettingsDir()
+	if err != nil {
 		return Settings{}, "", err
 	}
 	file := filepath.Join(dir, "settings.json")
@@ -144,14 +152,8 @@ func loadSettings() (Settings, string, error) {
 }
 
 func lockSettingsDir() (*os.File, error) {
-	dir, err := settingsDir()
+	dir, err := prepareSettingsDir()
 	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(dir, 0700); err != nil {
 		return nil, err
 	}
 	file, err := os.OpenFile(filepath.Join(dir, "settings.lock"), os.O_CREATE|os.O_RDWR, 0600)
