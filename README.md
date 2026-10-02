@@ -5,13 +5,13 @@
 Expose local HTTP services on subdomains of your own domain with a small Go CLI and [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/).
 
 ```sh
-mytunnel 5173 --subdomain plant
-# https://plant.example.com → 127.0.0.1:5173
+mytunnel 5173 --subdomain local-app
+# https://local-app.example.com → 127.0.0.1:5173
 ```
 
 One computer runs one shared `cloudflared` process and a local router. Each CLI command adds a route, keeps it alive, and removes it when you press Ctrl+C. Start another command to serve another port. A single wildcard DNS record covers every route, so starting a service requires no DNS changes or Cloudflare API calls.
 
-Without a configured domain, the same commands work locally at `http://plant.localhost:43187`.
+Without a configured domain, the same commands work locally at `http://local-app.localhost:43187`.
 
 ## Install
 
@@ -59,8 +59,8 @@ go build -o mytunnel .
 Run your HTTP application, then start a route:
 
 ```sh
-mytunnel 5173 --subdomain plant
-# http://plant.localhost:43187 → 127.0.0.1:5173
+mytunnel 5173 --subdomain local-app
+# http://local-app.localhost:43187 → 127.0.0.1:5173
 ```
 
 In another terminal:
@@ -77,7 +77,7 @@ Each command owns its route until Ctrl+C or a disconnected control session. Stop
 If your system does not resolve `*.localhost`, send the hostname explicitly:
 
 ```sh
-curl -H 'Host: plant.localhost' http://127.0.0.1:43187/
+curl -H 'Host: local-app.localhost' http://127.0.0.1:43187/
 ```
 
 Local mode is accessible only on your computer.
@@ -108,19 +108,19 @@ This requires a domain, a Cloudflare account, and `cloudflared` on the computer 
 5. Start a route:
 
    ```sh
-   mytunnel 5173 --subdomain plant
-   # https://plant.example.com → 127.0.0.1:5173
+   mytunnel 5173 --subdomain local-app
+   # https://local-app.example.com → 127.0.0.1:5173
    ```
 
 The local route is registered immediately. `cloudflared` may need a moment to connect to Cloudflare. Public HTTPS is available while your computer and CLI sessions are running. Once the tunnel stops, its DNS record remains.
 
-The router supports HTTP and WebSocket connections, and routes use one subdomain label such as `plant.example.com`. These public services have no additional authentication. Some development servers check the HTTP Host header; allow your chosen public hostname explicitly in the application's server settings.
+The router supports HTTP and WebSocket connections, and routes use one subdomain label such as `local-app.example.com`. These public services have no additional authentication. Some development servers check the HTTP Host header; allow your chosen public hostname explicitly in the application's server settings.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    browser["Browser: plant.example.com"] --> edge["Cloudflare HTTPS"]
+    browser["Browser: local-app.example.com"] --> edge["Cloudflare HTTPS"]
     edge --> tunnel["cloudflared"]
     tunnel --> router["Local router"]
     router --> app["127.0.0.1:5173"]
