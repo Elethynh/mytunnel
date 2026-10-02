@@ -1,5 +1,7 @@
 # mytunnel
 
+![Starting a public HTTPS tunnel with mytunnel](docs/assets/demo.gif)
+
 Expose local HTTP services on subdomains of your own domain with a small Go CLI and [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/).
 
 ```sh
