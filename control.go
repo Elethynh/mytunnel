@@ -16,11 +16,14 @@ type controlRequestType string
 const (
 	controlStatus   controlRequestType = "status"
 	controlRegister controlRequestType = "register"
+	controlObserve  controlRequestType = "observe"
 )
 
 const (
 	capabilityRouteInstances = "route-instances-v1"
 	capabilityReadiness      = "public-readiness-v1"
+	capabilityRequestLogs    = "request-logs-v1"
+	controlFrameLimit        = 4096
 )
 
 type controlRequest struct {
@@ -28,6 +31,7 @@ type controlRequest struct {
 	Type      controlRequestType `json:"type"`
 	Subdomain string             `json:"subdomain,omitempty"`
 	Port      int                `json:"port,omitempty"`
+	RouteID   string             `json:"routeId,omitempty"`
 }
 
 type routeStatus struct {
@@ -99,7 +103,7 @@ func sendControlContext(ctx context.Context, address string, request controlRequ
 
 func readControlFrame(reader *bufio.Reader) ([]byte, error) {
 	line, err := reader.ReadSlice('\n')
-	if errors.Is(err, bufio.ErrBufferFull) || len(line) > 4096 {
+	if errors.Is(err, bufio.ErrBufferFull) || len(line) > controlFrameLimit {
 		return nil, errors.New("daemon response is too long")
 	}
 	if err != nil {

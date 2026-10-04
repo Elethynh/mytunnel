@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-var daemonCapabilities = []string{capabilityRouteInstances, capabilityReadiness}
+var daemonCapabilities = []string{capabilityRouteInstances, capabilityReadiness, capabilityRequestLogs}
 
 type routeSpec struct {
 	Subdomain string
@@ -35,10 +35,12 @@ type routeReadiness struct {
 
 type routeOutput struct {
 	lines    chan string
+	logs     chan string
 	done     chan struct{}
 	project  bool
 	terminal bool
 	mu       sync.RWMutex
+	logDrops int
 	closed   bool
 	close    sync.Once
 }
@@ -47,13 +49,42 @@ const routeOutputFlushTimeout = 100 * time.Millisecond
 
 func newRouteOutput(writer io.Writer, routes int) *routeOutput {
 	output := &routeOutput{
-		lines: make(chan string, routes*8+8), done: make(chan struct{}),
+		lines: make(chan string, routes*8+8), logs: make(chan string, requestLogQueueCapacity), done: make(chan struct{}),
 		terminal: writerIsTerminal(writer),
 	}
 	go func() {
 		defer close(output.done)
-		for line := range output.lines {
-			_, _ = fmt.Fprintln(writer, line)
+		lines, logs := output.lines, output.logs
+		for lines != nil || logs != nil {
+			if lines != nil {
+				select {
+				case line, ok := <-lines:
+					if !ok {
+						lines = nil
+						continue
+					}
+					_, _ = fmt.Fprintln(writer, line)
+					continue
+				default:
+				}
+			}
+			select {
+			case line, ok := <-lines:
+				if !ok {
+					lines = nil
+					continue
+				}
+				_, _ = fmt.Fprintln(writer, line)
+			case line, ok := <-logs:
+				if !ok {
+					logs = nil
+					continue
+				}
+				_, _ = fmt.Fprintln(writer, line)
+				if dropped := output.takeLogDrops(); dropped > 0 {
+					_, _ = fmt.Fprintf(writer, "Warning: dropped %d request log events.\n", dropped)
+				}
+			}
 		}
 	}()
 	return output
@@ -68,11 +99,35 @@ func (o *routeOutput) enqueue(format string, values ...any) {
 	o.lines <- fmt.Sprintf(format, values...)
 }
 
+func (o *routeOutput) tryEnqueueLog(format string, values ...any) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return false
+	}
+	select {
+	case o.logs <- fmt.Sprintf(format, values...):
+		return true
+	default:
+		o.logDrops++
+		return false
+	}
+}
+
+func (o *routeOutput) takeLogDrops() int {
+	o.mu.Lock()
+	dropped := o.logDrops
+	o.logDrops = 0
+	o.mu.Unlock()
+	return dropped
+}
+
 func (o *routeOutput) closeOutput() {
 	o.close.Do(func() {
 		o.mu.Lock()
 		o.closed = true
 		close(o.lines)
+		close(o.logs)
 		o.mu.Unlock()
 	})
 }
@@ -246,7 +301,11 @@ func runRouteSessions(ctx context.Context, specs []routeSpec, writer io.Writer, 
 	output := newRouteOutput(writer, len(specs))
 	output.project = project
 	defer output.closeAndWait()
-	settings, group, err := acquireRouteSessionsWithOutput(ctx, specs, output)
+	var requiredCapabilities []string
+	if options.Logs {
+		requiredCapabilities = append(requiredCapabilities, capabilityRequestLogs)
+	}
+	settings, group, err := acquireRouteSessionsWithOutput(ctx, specs, output, requiredCapabilities...)
 	if err != nil {
 		var registrationErr *routeRegistrationError
 		if project && errors.As(err, &registrationErr) {
@@ -266,6 +325,11 @@ func runRouteSessions(ctx context.Context, specs []routeSpec, writer io.Writer, 
 
 func runAcquiredRouteSessions(settings Settings, group *routeSessionGroup, output *routeOutput, probe readinessProbe, options startupOptions, sharing sharingActions) error {
 	routes := group.Routes()
+	var logs *requestLogDisplay
+	if options.Logs {
+		logs = startRequestLogs(group.Context(), settings, routes, output)
+		defer logs.Close()
+	}
 	sharing.afterRegistration(settings, routes, options)
 	if settings.Domain != "" {
 		for _, route := range routes {

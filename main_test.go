@@ -218,63 +218,83 @@ func TestStatusURLs(t *testing.T) {
 }
 
 func TestWebSocketUpgradePassesThrough(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		connection, buffered, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		defer connection.Close()
-		fmt.Fprint(buffered, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-		buffered.Flush()
-		payload := make([]byte, 4)
-		if _, err := io.ReadFull(buffered, payload); err != nil {
-			t.Error(err)
-			return
-		}
-		connection.Write(payload)
-	}))
-	defer backend.Close()
-	port := serverPort(backend)
-	settings := Settings{Token: strings.Repeat("e", 64)}
-	daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer daemon.Close()
-	response, route, err := sendControl(daemon.socketPath, controlRequest{Token: settings.Token, Type: controlRegister, Subdomain: "socket", Port: port})
-	if err != nil || !response.OK {
-		t.Fatalf("route: %+v, %v", response, err)
-	}
-	defer route.Close()
-	client, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", daemon.RouterPort))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	client.SetDeadline(time.Now().Add(2 * time.Second))
-	fmt.Fprint(client, "GET / HTTP/1.1\r\nHost: socket.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-	reader := bufio.NewReader(client)
-	status, err := reader.ReadString('\n')
-	if err != nil || !strings.Contains(status, "101") {
-		t.Fatalf("upgrade: %q, %v", status, err)
-	}
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if line == "\r\n" {
-			break
-		}
-	}
-	client.Write([]byte("ping"))
-	got := make([]byte, 4)
-	if _, err := io.ReadFull(reader, got); err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "ping" {
-		t.Fatalf("echo = %q", got)
+	for _, logs := range []bool{false, true} {
+		t.Run(fmt.Sprintf("logs=%t", logs), func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				connection, buffered, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer connection.Close()
+				fmt.Fprint(buffered, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+				buffered.Flush()
+				payload := make([]byte, 4)
+				if _, err := io.ReadFull(buffered, payload); err != nil {
+					t.Error(err)
+					return
+				}
+				connection.Write(payload)
+			}))
+			defer backend.Close()
+			settings := Settings{Token: strings.Repeat("e", 64)}
+			daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer daemon.Close()
+			response, route, err := sendControl(daemon.socketPath, controlRequest{
+				Token: settings.Token, Type: controlRegister, Subdomain: "socket", Port: serverPort(backend),
+			})
+			if err != nil || !response.OK {
+				t.Fatalf("route: %+v, %v", response, err)
+			}
+			defer route.Close()
+			var observer *controlConnection
+			if logs {
+				observer = observeRegisteredRoute(t, daemon, settings, response, "socket")
+			}
+			client, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", daemon.RouterPort))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			client.SetDeadline(time.Now().Add(2 * time.Second))
+			fmt.Fprint(client, "GET / HTTP/1.1\r\nHost: socket.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+			reader := bufio.NewReader(client)
+			status, err := reader.ReadString('\n')
+			if err != nil || !strings.Contains(status, "101") {
+				t.Fatalf("upgrade: %q, %v", status, err)
+			}
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatal(err)
+				}
+				if line == "\r\n" {
+					break
+				}
+			}
+			client.Write([]byte("ping"))
+			got := make([]byte, 4)
+			if _, err := io.ReadFull(reader, got); err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "ping" {
+				t.Fatalf("echo = %q", got)
+			}
+			client.Close()
+			if logs {
+				event := readRequestLogEvent(t, observer)
+				if event.Status != http.StatusSwitchingProtocols || event.Path != "/" {
+					t.Fatalf("WebSocket event = %+v", event)
+				}
+				observer.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+				if frame, err := observer.readFrame(); err == nil {
+					t.Fatalf("WebSocket emitted extra completion %q", frame)
+				}
+			}
+		})
 	}
 }
 
