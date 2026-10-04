@@ -408,7 +408,7 @@ func TestProjectDisplaysFirstRegistrationWhileSecondIsBlocked(t *testing.T) {
 		done <- runRouteSessions(context.Background(), []routeSpec{
 			{Subdomain: "first", Port: 3000},
 			{Subdomain: "second", Port: 3001},
-		}, writer, newReadinessProbe(), true)
+		}, writer, newReadinessProbe(), true, startupOptions{})
 	}()
 	select {
 	case <-secondStarted:
@@ -453,7 +453,7 @@ func TestBlockedProjectOutputDoesNotHoldSettingsLockOrCancellation(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- runRouteSessions(ctx, []routeSpec{{Subdomain: "blocked", Port: 3000}}, writer, newReadinessProbe(), true)
+		done <- runRouteSessions(ctx, []routeSpec{{Subdomain: "blocked", Port: 3000}}, writer, newReadinessProbe(), true, startupOptions{})
 	}()
 	select {
 	case <-writer.started:
@@ -542,7 +542,7 @@ func TestReadinessTimeoutKeepsAcquiredRouteActiveUntilCancellation(t *testing.T)
 		done <- runAcquiredRouteSessions(settings, group, output, readinessProbe{
 			client: readinessServer.Client(), overallTimeout: 40 * time.Millisecond,
 			requestTimeout: 20 * time.Millisecond, retryDelay: 5 * time.Millisecond,
-		})
+		}, startupOptions{}, newSharingActions(output))
 	}()
 	time.Sleep(100 * time.Millisecond)
 	select {
@@ -570,7 +570,7 @@ func TestReadinessTimeoutKeepsAcquiredRouteActiveUntilCancellation(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("runner cancellation was not prompt")
 	}
-	output.close()
+	output.closeOutput()
 	<-output.done
 	text := outputBuffer.String()
 	if !strings.Contains(text, "Checking public reachability: ") ||
@@ -619,12 +619,14 @@ func TestLocalSessionReportsRegistrationWithoutPublicProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- runAcquiredRouteSessions(loaded, group, output, newReadinessProbe()) }()
+	go func() {
+		done <- runAcquiredRouteSessions(loaded, group, output, newReadinessProbe(), startupOptions{}, newSharingActions(output))
+	}()
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	output.close()
+	output.closeOutput()
 	<-output.done
 	text := buffer.String()
 	if !strings.Contains(text, "Local route registered: http://local.localhost:") {

@@ -279,15 +279,19 @@ func TestProjectCollisionRollsBackNewRoutesAndKeepsExistingOwner(t *testing.T) {
 	if err := os.WriteFile(projectPath, []byte(`{"version":1,"routes":[{"port":5173,"subdomain":"first"},{"port":8080,"subdomain":"taken"}]}`), 0600); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("PATH", t.TempDir())
 
 	var output bytes.Buffer
-	err = runProject(context.Background(), []string{"--config", projectPath}, &output, newReadinessProbe())
+	err = runProject(context.Background(), []string{"--config", projectPath, "--open", "--copy", "--qr"}, &output, newReadinessProbe())
 	if err == nil || !strings.Contains(err.Error(), `route "taken"`) || !strings.Contains(err.Error(), "displayed project group was rolled back") {
 		t.Fatalf("project error = %v", err)
 	}
 	waitForDaemonRoutes(t, daemon, "taken")
 	if !strings.Contains(output.String(), "Project route registered (startup pending, local): http://first.localhost:") {
 		t.Fatalf("rollback output = %q", output.String())
+	}
+	if strings.Contains(output.String(), "Copying registered URLs") || strings.Contains(output.String(), "QR code") || strings.Contains(output.String(), "phone") {
+		t.Fatalf("sharing ran for a rolled-back group: %q", output.String())
 	}
 }
 

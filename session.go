@@ -34,15 +34,22 @@ type routeReadiness struct {
 }
 
 type routeOutput struct {
-	lines   chan string
-	done    chan struct{}
-	project bool
+	lines    chan string
+	done     chan struct{}
+	project  bool
+	terminal bool
+	mu       sync.RWMutex
+	closed   bool
+	close    sync.Once
 }
 
 const routeOutputFlushTimeout = 100 * time.Millisecond
 
 func newRouteOutput(writer io.Writer, routes int) *routeOutput {
-	output := &routeOutput{lines: make(chan string, routes*3+2), done: make(chan struct{})}
+	output := &routeOutput{
+		lines: make(chan string, routes*8+8), done: make(chan struct{}),
+		terminal: writerIsTerminal(writer),
+	}
 	go func() {
 		defer close(output.done)
 		for line := range output.lines {
@@ -53,13 +60,25 @@ func newRouteOutput(writer io.Writer, routes int) *routeOutput {
 }
 
 func (o *routeOutput) enqueue(format string, values ...any) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.closed {
+		return
+	}
 	o.lines <- fmt.Sprintf(format, values...)
 }
 
-func (o *routeOutput) close() { close(o.lines) }
+func (o *routeOutput) closeOutput() {
+	o.close.Do(func() {
+		o.mu.Lock()
+		o.closed = true
+		close(o.lines)
+		o.mu.Unlock()
+	})
+}
 
 func (o *routeOutput) closeAndWait() {
-	o.close()
+	o.closeOutput()
 	timer := time.NewTimer(routeOutputFlushTimeout)
 	defer timer.Stop()
 	select {
@@ -223,7 +242,7 @@ func acquireRouteSessionsWithOutput(ctx context.Context, specs []routeSpec, outp
 	return settings, group, nil
 }
 
-func runRouteSessions(ctx context.Context, specs []routeSpec, writer io.Writer, probe readinessProbe, project bool) error {
+func runRouteSessions(ctx context.Context, specs []routeSpec, writer io.Writer, probe readinessProbe, project bool, options startupOptions) error {
 	output := newRouteOutput(writer, len(specs))
 	output.project = project
 	defer output.closeAndWait()
@@ -242,11 +261,12 @@ func runRouteSessions(ctx context.Context, specs []routeSpec, writer io.Writer, 
 	if project {
 		output.enqueue("Project startup complete: all routes registered.")
 	}
-	return runAcquiredRouteSessions(settings, group, output, probe)
+	return runAcquiredRouteSessions(settings, group, output, probe, options, newSharingActions(output))
 }
 
-func runAcquiredRouteSessions(settings Settings, group *routeSessionGroup, output *routeOutput, probe readinessProbe) error {
+func runAcquiredRouteSessions(settings Settings, group *routeSessionGroup, output *routeOutput, probe readinessProbe, options startupOptions, sharing sharingActions) error {
 	routes := group.Routes()
+	sharing.afterRegistration(settings, routes, options)
 	if settings.Domain != "" {
 		for _, route := range routes {
 			output.enqueue("Checking public reachability: %s", route.URL())
@@ -255,6 +275,7 @@ func runAcquiredRouteSessions(settings Settings, group *routeSessionGroup, outpu
 			switch result.Status {
 			case readinessConfirmed:
 				output.enqueue("Public reachability confirmed: %s", result.Route.URL())
+				sharing.confirmed(result.Route, options)
 			case readinessTimedOut:
 				output.enqueue("Warning: public reachability was not confirmed for %s within 30 seconds; check the hostname's DNS destination and daemon.log. The route remains active.", result.Route.URL())
 			}

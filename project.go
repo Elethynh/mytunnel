@@ -99,5 +99,5 @@ func runProject(ctx context.Context, args []string, writer io.Writer, probe read
 	if err != nil {
 		return err
 	}
-	return runRouteSessions(ctx, routes, writer, probe, true)
+	return runRouteSessions(ctx, routes, writer, probe, true, options)
 }

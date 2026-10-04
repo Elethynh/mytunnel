@@ -283,7 +283,7 @@ func route(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	err = runRouteSessions(ctx, []routeSpec{{Subdomain: name, Port: port}}, os.Stdout, newReadinessProbe(), false)
+	err = runRouteSessions(ctx, []routeSpec{{Subdomain: name, Port: port}}, os.Stdout, newReadinessProbe(), false, options)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
