@@ -2,20 +2,116 @@
 
 TLDR: You know ngrok? This is your basic ngrok - free (except for a domain)
 
+## Basic usage
+
 ![Starting a public HTTPS tunnel with mytunnel](docs/assets/demo.gif)
 
-Expose local HTTP services on subdomains of your own domain with a small Go CLI and [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/).
+Expose a local HTTP service on a subdomain of your own domain with one command.
 
 ```sh
 mytunnel 5173 --subdomain local-app
 # https://local-app.example.com → 127.0.0.1:5173
 ```
 
-One computer runs one shared `cloudflared` process and a local router. Each startup command adds one or more routes, keeps them alive, and removes its routes when you press Ctrl+C. Start another command or use a project file to serve more ports. A single wildcard DNS record covers every route, so starting a service requires no DNS changes or Cloudflare API calls.
+Keep the command running to keep the route available. Press Ctrl+C to remove it. Run another command with a different port and subdomain to expose another service. Omit `--subdomain` to generate a random name.
 
-Without a configured domain, the same commands work locally at `http://local-app.localhost:43187`.
+One computer shares one [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/) and a local router across all routes. A wildcard DNS record covers them all, so starting a route requires no DNS changes or Cloudflare API calls. Without a configured domain, the same command works at `http://local-app.localhost:43187` on your computer.
 
-## Install
+## Additional options
+
+`--open`, `--copy`, `--qr`, and `--logs` work with both `mytunnel <port>` and `mytunnel up`. Combine them as needed.
+
+```sh
+mytunnel 5173 --subdomain local-app --open --copy --qr --logs
+```
+
+The recordings below use a running local demo app and a configured public domain.
+
+### Open the browser with `--open`
+
+Open the URL in your default browser. Public URLs open after mytunnel confirms that HTTPS reaches the active route. Local URLs open immediately.
+
+```sh
+mytunnel 5173 --subdomain local-app --open
+```
+
+![mytunnel confirms the public route and opens the local app in Firefox](docs/assets/option-open.gif)
+
+### Copy the URL with `--copy`
+
+Copy the URL to your clipboard at startup. With `up`, all URLs are copied once, one per line, in project-file order. Copying happens before public confirmation finishes.
+
+```sh
+mytunnel 5173 --subdomain local-app --copy
+```
+
+![mytunnel copies the URL, which is then pasted into the browser address bar](docs/assets/option-copy.gif)
+
+### Show a QR code with `--qr`
+
+Print a QR code for each public URL to open it on your phone. No extra QR program is needed. Localhost URLs cannot be reached from a phone, so local mode prints an explanation instead.
+
+```sh
+mytunnel 5173 --subdomain local-app --qr
+```
+
+![mytunnel prints a terminal QR code for the public URL](docs/assets/option-qr.gif)
+
+### Watch requests with `--logs`
+
+See each completed request's route, method, path, status, and duration. Logs belong to the routes started by that command and omit query strings, headers, bodies, and readiness checks.
+
+```sh
+mytunnel 5173 --subdomain local-app --logs
+```
+
+![HTTP requests appear in the terminal with their status and duration](docs/assets/option-logs.gif)
+
+### Start several services with `up`
+
+Save your routes in `.mytunnel.json` in the project directory. Start the applications themselves first, then expose every route with one command.
+
+```json
+{
+  "version": 1,
+  "routes": [
+    { "port": 5173, "subdomain": "local-app" },
+    { "port": 8080, "subdomain": "api" }
+  ]
+}
+```
+
+```sh
+mytunnel up
+```
+
+![mytunnel up reads the project file and starts two public routes](docs/assets/option-up.gif)
+
+Ctrl+C removes this project's routes. Routes started by other commands stay active.
+
+### Choose a project file with `--config`
+
+Load a specific project file instead of `.mytunnel.json` in the current directory. Useful for keeping separate route sets for different projects or environments.
+
+```sh
+mytunnel up --config ./config/dev.mytunnel.json
+```
+
+![mytunnel up loads routes from an explicitly selected configuration file](docs/assets/option-config.gif)
+
+### List active routes with `status`
+
+Show routes owned by all running mytunnel commands on this computer, including their URLs and local ports.
+
+```sh
+mytunnel status
+```
+
+![mytunnel status lists the active local-app and api routes](docs/assets/option-status.gif)
+
+---
+
+## Installation
 
 ### Download a binary
 
@@ -58,7 +154,7 @@ cd mytunnel
 go build -o mytunnel .
 ```
 
-## Try it before buying a domain
+### Try it before buying a domain
 
 Run your HTTP application, then start a route:
 
@@ -86,57 +182,7 @@ curl -H 'Host: local-app.localhost' http://127.0.0.1:43187/
 
 Local mode is accessible only on your computer.
 
-## Start a project
-
-Add a `.mytunnel.json` file to a project when you want to start several routes together:
-
-```json
-{
-  "version": 1,
-  "routes": [
-    { "port": 5173, "subdomain": "local-app" },
-    { "port": 8080, "subdomain": "api" }
-  ]
-}
-```
-
-Start every route declared in the file:
-
-```sh
-mytunnel up
-```
-
-`mytunnel up` reads `.mytunnel.json` from the current directory. It does not search parent directories. Select an exact alternate path with `--config`:
-
-```sh
-mytunnel up --config ./config/dev.mytunnel.json
-```
-
-The version 1 schema accepts only `version` and `routes` at the top level, and only an explicit `port` and `subdomain` for every route. Unknown fields are rejected. The file does not contain credentials, domain setup, shell commands, or sharing preferences.
-
-The complete file is validated before any route starts. If registration later fails, mytunnel reports the failed route and releases only the routes acquired by that `up` command. Routes owned by other commands remain active.
-
-## Share URLs and inspect requests
-
-The startup flags work with both the port-first command and `up`. They are optional and can be combined:
-
-```sh
-mytunnel 5173 --subdomain local-app --open --copy --qr --logs
-mytunnel up --config ./config/dev.mytunnel.json --open --copy --qr --logs
-```
-
-- `--open` opens each local URL immediately. In public mode it opens a route only after public confirmation succeeds. A timed-out public route is not opened automatically.
-- `--copy` sends all registered URLs to the clipboard once, as one newline-separated payload in project-file order.
-- `--qr` prints a labelled terminal QR for each public URL. The QR is generated inside mytunnel, so no QR runtime program is required. In local mode, mytunnel keeps printing the ordinary URL and explains that a `localhost` URL cannot be reached from a phone.
-- `--logs` streams completed requests for only the routes owned by that command. Each line contains the route label, method, path, status, and duration, for example `[local-app] GET /products 200 12ms`.
-
-On macOS, `--open` uses `open` and `--copy` uses `pbcopy`. On Linux, opening uses `xdg-open`; copying uses `wl-copy` in a Wayland session or `xclip` in an X11 session. These helpers are optional. A missing helper, QR error, or failed sharing action produces a warning and leaves the routes active.
-
-Clipboard copying happens after registration, before public confirmation, and preserves the declared route order. Public QR codes are also printed at registration. Sharing flags never change the project file.
-
-Request logs omit query strings, headers, request and response bodies, credentials, and readiness probes. Metadata is escaped for safe terminal output, and request events are never written to `daemon.log`. A streaming request appears after its stream ends, when its final status and duration are known. Logging uses bounded queues so a slow terminal cannot delay HTTP or WebSocket traffic; mytunnel warns when events are dropped.
-
-## Set up public HTTPS
+### Set up public HTTPS with Cloudflare
 
 This requires a domain, a Cloudflare account, and `cloudflared` on the computer serving your applications. The domain can be registered with Cloudflare or another registrar.
 
@@ -172,7 +218,23 @@ Public HTTPS is available while your computer and CLI sessions are running. Once
 
 The router supports HTTP and WebSocket connections, and routes use one subdomain label such as `local-app.example.com`. These public services have no additional authentication. Some development servers check the HTTP Host header; allow your chosen public hostname explicitly in the application's server settings.
 
-## How it works
+### Sharing helpers and request logs
+
+On macOS, `--open` uses `open` and `--copy` uses `pbcopy`. On Linux, opening uses `xdg-open`. Copying uses `wl-copy` in a Wayland session or `xclip` in an X11 session. These helpers are optional. A missing helper, QR error, or failed sharing action produces a warning and leaves the routes active.
+
+Public QR codes are printed at registration, while public confirmation is pending. A public route that times out is not opened automatically by `--open`. Sharing flags never change the project file.
+
+Request metadata is escaped for safe terminal output. Request events are never written to `daemon.log`. A streaming request appears after its stream ends, when its final status and duration are known. Bounded log queues prevent a slow terminal from delaying HTTP or WebSocket traffic. mytunnel warns when events are dropped.
+
+### Project file rules
+
+`mytunnel up` reads `.mytunnel.json` from the current directory without searching parent directories. `--config` selects an exact alternate path.
+
+The version 1 schema accepts only `version` and `routes` at the top level, and only an explicit `port` and `subdomain` for every route. Unknown fields are rejected. The file does not contain credentials, domain setup, shell commands, or sharing preferences.
+
+The complete file is validated before any route starts. If registration later fails, mytunnel reports the failed route and releases only the routes acquired by that `up` command. Routes owned by other commands remain active.
+
+### How it works
 
 ```mermaid
 flowchart LR
@@ -188,7 +250,7 @@ Settings and daemon logs live in `~/.config/mytunnel/`, or `$XDG_CONFIG_HOME/myt
 
 The CLI and daemon negotiate feature support. If a newer CLI reports that the running daemon is from an older version, stop the active mytunnel commands you own and retry the new command. mytunnel does not forcibly kill the old daemon or unrelated sessions.
 
-## Development and releases
+### Development and releases
 
 ```sh
 go test -race ./...
@@ -207,7 +269,7 @@ To build the four release archives and their SHA-256 checksums:
 
 Pushing a version tag such as `v0.2.0` runs the release workflow, repeats the checks, and publishes the archives to GitHub Releases.
 
-## License
+### License
 
 [MIT](LICENSE).
 
