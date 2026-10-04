@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strings"
 	"sync"
+	"time"
 )
 
 var daemonCapabilities = []string{capabilityRouteInstances, capabilityReadiness}
@@ -32,9 +34,12 @@ type routeReadiness struct {
 }
 
 type routeOutput struct {
-	lines chan string
-	done  chan struct{}
+	lines   chan string
+	done    chan struct{}
+	project bool
 }
+
+const routeOutputFlushTimeout = 100 * time.Millisecond
 
 func newRouteOutput(writer io.Writer, routes int) *routeOutput {
 	output := &routeOutput{lines: make(chan string, routes*3+2), done: make(chan struct{})}
@@ -52,6 +57,25 @@ func (o *routeOutput) enqueue(format string, values ...any) {
 }
 
 func (o *routeOutput) close() { close(o.lines) }
+
+func (o *routeOutput) closeAndWait() {
+	o.close()
+	timer := time.NewTimer(routeOutputFlushTimeout)
+	defer timer.Stop()
+	select {
+	case <-o.done:
+	case <-timer.C:
+	}
+}
+
+type routeRegistrationError struct {
+	spec     routeSpec
+	acquired int
+	err      error
+}
+
+func (e *routeRegistrationError) Error() string { return e.err.Error() }
+func (e *routeRegistrationError) Unwrap() error { return e.err }
 
 type ownedRouteSession struct {
 	spec       routeSpec
@@ -158,19 +182,26 @@ func acquireRouteSessionsWithOutput(ctx context.Context, specs []routeSpec, outp
 			if cause := context.Cause(group.Context()); cause != nil && !errors.Is(cause, context.Canceled) {
 				err = cause
 			}
+			registrationErr := &routeRegistrationError{spec: spec, acquired: len(group.Routes()), err: err}
 			group.Close()
-			return Settings{}, nil, err
+			return Settings{}, nil, registrationErr
 		}
 		if !response.OK {
 			connection.Close()
+			registrationErr := &routeRegistrationError{
+				spec: spec, acquired: len(group.Routes()), err: errors.New(response.Error),
+			}
 			group.Close()
-			return Settings{}, nil, errors.New(response.Error)
+			return Settings{}, nil, registrationErr
 		}
 		if response.RouteID == "" || !hasCapabilities(response.Capabilities, requiredCapabilities) ||
 			(settings.Domain != "" && (response.ReadinessPath == "" || response.ReadinessProof == "")) {
 			connection.Close()
+			registrationErr := &routeRegistrationError{
+				spec: spec, acquired: len(group.Routes()), err: oldDaemonError(),
+			}
 			group.Close()
-			return Settings{}, nil, oldDaemonError()
+			return Settings{}, nil, registrationErr
 		}
 		session := &ownedRouteSession{
 			spec: spec, address: response.URL, instance: response.RouteID,
@@ -182,20 +213,35 @@ func acquireRouteSessionsWithOutput(ctx context.Context, specs []routeSpec, outp
 			if settings.Domain != "" {
 				mode = "Public"
 			}
-			output.enqueue("%s route registered: %s → 127.0.0.1:%d", mode, session.URL(), session.Spec().Port)
+			if output.project {
+				output.enqueue("Project route registered (startup pending, %s): %s → 127.0.0.1:%d", strings.ToLower(mode), session.URL(), session.Spec().Port)
+			} else {
+				output.enqueue("%s route registered: %s → 127.0.0.1:%d", mode, session.URL(), session.Spec().Port)
+			}
 		}
 	}
 	return settings, group, nil
 }
 
-func runRouteSessions(ctx context.Context, specs []routeSpec, writer io.Writer, probe readinessProbe) error {
+func runRouteSessions(ctx context.Context, specs []routeSpec, writer io.Writer, probe readinessProbe, project bool) error {
 	output := newRouteOutput(writer, len(specs))
-	defer output.close()
+	output.project = project
+	defer output.closeAndWait()
 	settings, group, err := acquireRouteSessionsWithOutput(ctx, specs, output)
 	if err != nil {
+		var registrationErr *routeRegistrationError
+		if project && errors.As(err, &registrationErr) {
+			if registrationErr.acquired > 0 {
+				return fmt.Errorf("project route %q failed; the displayed project group was rolled back: %w", registrationErr.spec.Subdomain, registrationErr.err)
+			}
+			return fmt.Errorf("project route %q failed: %w", registrationErr.spec.Subdomain, registrationErr.err)
+		}
 		return err
 	}
 	defer group.Close()
+	if project {
+		output.enqueue("Project startup complete: all routes registered.")
+	}
 	return runAcquiredRouteSessions(settings, group, output, probe)
 }
 

@@ -24,6 +24,7 @@ func run(args []string) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		fmt.Printf(`Usage:
   mytunnel <port> [--subdomain name]  Expose a local HTTP service
+  mytunnel up [--config path]         Expose all routes in a project file
   mytunnel status                    Show active routes
   mytunnel --version                 Show the installed version
   mytunnel configure --domain domain --tunnel UUID --credentials file.json
@@ -52,9 +53,21 @@ Each command keeps its route active until Ctrl+C.
 			return errors.New("status does not accept arguments")
 		}
 		return status()
+	case "up":
+		return project(args[1:])
 	default:
 		return route(args)
 	}
+}
+
+func project(args []string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	err := runProject(ctx, args, os.Stdout, newReadinessProbe())
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 func parseOptions(args []string, allowed ...string) (map[string]string, error) {
@@ -270,7 +283,7 @@ func route(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	err = runRouteSessions(ctx, []routeSpec{{Subdomain: name, Port: port}}, os.Stdout, newReadinessProbe())
+	err = runRouteSessions(ctx, []routeSpec{{Subdomain: name, Port: port}}, os.Stdout, newReadinessProbe(), false)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil

@@ -26,6 +26,27 @@ type fakeRouteSession struct {
 	once   sync.Once
 }
 
+type signalingWriter struct {
+	lines chan string
+}
+
+func (w signalingWriter) Write(data []byte) (int, error) {
+	w.lines <- string(data)
+	return len(data), nil
+}
+
+type blockingWriter struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingWriter) Write(data []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	<-w.release
+	return len(data), nil
+}
+
 func newFakeRouteSession(name string) *fakeRouteSession {
 	return &fakeRouteSession{
 		spec:   routeSpec{Subdomain: name, Port: 3000},
@@ -77,6 +98,7 @@ func TestRouteSessionGroupOwnershipLossClosesTheGroup(t *testing.T) {
 	group := newRouteSessionGroup(context.Background())
 	first := newFakeRouteSession("first")
 	second := newFakeRouteSession("second")
+	unrelated := newFakeRouteSession("unrelated")
 	group.add(first)
 	group.add(second)
 
@@ -89,6 +111,12 @@ func TestRouteSessionGroupOwnershipLossClosesTheGroup(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("sibling session was not closed")
 	}
+	select {
+	case <-unrelated.closed:
+		t.Fatal("unrelated session was closed")
+	default:
+	}
+	unrelated.Close()
 }
 
 func TestLockSettingsDirContextCanBeCancelled(t *testing.T) {
@@ -327,6 +355,126 @@ func TestAcquisitionFailureReleasesEarlierRoutes(t *testing.T) {
 	case <-firstReleased:
 	case <-time.After(time.Second):
 		t.Fatal("earlier route was not released")
+	}
+}
+
+func TestProjectDisplaysFirstRegistrationWhileSecondIsBlocked(t *testing.T) {
+	dir := socketTestDir(t)
+	t.Setenv("MYTUNNEL_HOME", dir)
+	settings := Settings{Token: strings.Repeat("c", 64), RouterPort: defaultRouterPort}
+	if err := saveSettings(settings, dir); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", controlAddress(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	go func() {
+		status, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		_ = json.NewDecoder(status).Decode(&controlRequest{})
+		_ = json.NewEncoder(status).Encode(controlResponse{OK: true, Capabilities: daemonCapabilities})
+		status.Close()
+
+		first, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		_ = json.NewDecoder(first).Decode(&controlRequest{})
+		_ = json.NewEncoder(first).Encode(controlResponse{
+			OK: true, URL: "http://first.localhost", RouteID: "first-id", Capabilities: daemonCapabilities,
+		})
+		defer first.Close()
+
+		second, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer second.Close()
+		_ = json.NewDecoder(second).Decode(&controlRequest{})
+		close(secondStarted)
+		<-releaseSecond
+		_ = json.NewEncoder(second).Encode(controlResponse{Error: "Subdomain second is already in use."})
+	}()
+
+	writer := signalingWriter{lines: make(chan string, 4)}
+	done := make(chan error, 1)
+	go func() {
+		done <- runRouteSessions(context.Background(), []routeSpec{
+			{Subdomain: "first", Port: 3000},
+			{Subdomain: "second", Port: 3001},
+		}, writer, newReadinessProbe(), true)
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second registration did not start")
+	}
+	select {
+	case line := <-writer.lines:
+		if !strings.Contains(line, "Project route registered (startup pending, local): http://first.localhost") {
+			t.Fatalf("first output = %q", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first registration was not displayed while the second was pending")
+	}
+	close(releaseSecond)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), `route "second"`) || !strings.Contains(err.Error(), "rolled back") {
+			t.Fatalf("runner error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runner did not return after second registration failed")
+	}
+}
+
+func TestBlockedProjectOutputDoesNotHoldSettingsLockOrCancellation(t *testing.T) {
+	dir := socketTestDir(t)
+	t.Setenv("MYTUNNEL_HOME", dir)
+	settings := Settings{Token: strings.Repeat("d", 64), RouterPort: defaultRouterPort}
+	if err := saveSettings(settings, dir); err != nil {
+		t.Fatal(err)
+	}
+	daemonSettings := settings
+	daemonSettings.RouterPort = 0
+	daemon, err := startDaemon(daemonSettings, dir, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	writer := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+	defer close(writer.release)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runRouteSessions(ctx, []routeSpec{{Subdomain: "blocked", Port: 3000}}, writer, newReadinessProbe(), true)
+	}()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("registration output did not start")
+	}
+	lockCtx, stopWaiting := context.WithTimeout(context.Background(), time.Second)
+	defer stopWaiting()
+	lock, err := lockSettingsDirContext(lockCtx)
+	if err != nil {
+		t.Fatalf("blocked output held the settings lock: %v", err)
+	}
+	lock.Close()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner cancellation: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("blocked output delayed cancellation")
 	}
 }
 
