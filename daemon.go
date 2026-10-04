@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,11 +41,12 @@ type Daemon struct {
 }
 
 type routeTarget struct {
+	id    string
 	port  int
 	proxy *httputil.ReverseProxy
 }
 
-func newRouteTarget(port int) *routeTarget {
+func newRouteTarget(id string, port int) *routeTarget {
 	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", port)}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -52,7 +55,7 @@ func newRouteTarget(port int) *routeTarget {
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "The local service is not responding.", http.StatusBadGateway)
 	}
-	return &routeTarget{port: port, proxy: proxy}
+	return &routeTarget{id: id, port: port, proxy: proxy}
 }
 
 func startDaemon(settings Settings, dir string, idleAfter time.Duration) (*Daemon, error) {
@@ -195,8 +198,9 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		d.mu.Unlock()
 	}()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	line, err := bufio.NewReader(io.LimitReader(conn, 4097)).ReadBytes('\n')
-	if err != nil || len(line) > 4096 {
+	reader := bufio.NewReaderSize(conn, 4096)
+	line, err := readControlFrame(reader)
+	if err != nil {
 		d.reply(conn, controlResponse{Error: "Invalid command."})
 		return
 	}
@@ -207,7 +211,7 @@ func (d *Daemon) handleControl(conn net.Conn) {
 	}
 	if request.Type == controlStatus {
 		d.mu.RLock()
-		response := controlResponse{OK: true, Domain: d.settings.Domain}
+		response := controlResponse{OK: true, Domain: d.settings.Domain, Capabilities: daemonCapabilities}
 		for name, target := range d.routes {
 			response.Routes = append(response.Routes, routeStatus{name, target.port})
 		}
@@ -228,6 +232,12 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		d.reply(conn, controlResponse{Error: err.Error()})
 		return
 	}
+	routeIDBytes := make([]byte, 16)
+	if _, err := rand.Read(routeIDBytes); err != nil {
+		d.reply(conn, controlResponse{Error: "Could not create a route instance."})
+		return
+	}
+	routeID := hex.EncodeToString(routeIDBytes)
 	d.mu.Lock()
 	if d.stopping || d.closed {
 		d.mu.Unlock()
@@ -244,16 +254,18 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		d.reply(conn, controlResponse{Error: "Cannot forward the router port to itself."})
 		return
 	}
-	d.routes[name] = newRouteTarget(request.Port)
+	d.routes[name] = newRouteTarget(routeID, request.Port)
 	owned = name
 	d.resetIdleLocked()
 	d.mu.Unlock()
 	address := routeURL(name, d.settings.Domain, d.RouterPort)
-	if err := d.reply(conn, controlResponse{OK: true, URL: address}); err != nil {
+	if err := d.reply(conn, controlResponse{
+		OK: true, URL: address, RouteID: routeID, Capabilities: daemonCapabilities,
+	}); err != nil {
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
-	io.Copy(io.Discard, conn)
+	io.Copy(io.Discard, reader)
 }
 
 func (d *Daemon) reply(conn net.Conn, response controlResponse) error {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type Settings struct {
@@ -152,6 +154,10 @@ func loadSettings() (Settings, string, error) {
 }
 
 func lockSettingsDir() (*os.File, error) {
+	return lockSettingsDirContext(context.Background())
+}
+
+func lockSettingsDirContext(ctx context.Context) (*os.File, error) {
 	dir, err := prepareSettingsDir()
 	if err != nil {
 		return nil, err
@@ -160,11 +166,28 @@ func lockSettingsDir() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		file.Close()
-		return nil, err
+	retry := time.NewTicker(25 * time.Millisecond)
+	defer retry.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			file.Close()
+			return nil, err
+		}
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return file, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			file.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			file.Close()
+			return nil, ctx.Err()
+		case <-retry.C:
+		}
 	}
-	return file, nil
 }
 
 func saveSettings(settings Settings, dir string) error {

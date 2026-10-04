@@ -1,12 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -80,7 +79,11 @@ func parseOptions(args []string, allowed ...string) (map[string]string, error) {
 }
 
 func probeStatus(settings Settings, dir string) (*controlResponse, error) {
-	response, conn, err := sendControl(controlAddress(dir), controlRequest{Token: settings.Token, Type: controlStatus})
+	return probeStatusContext(context.Background(), settings, dir)
+}
+
+func probeStatusContext(ctx context.Context, settings Settings, dir string) (*controlResponse, error) {
+	response, conn, err := sendControlContext(ctx, controlAddress(dir), controlRequest{Token: settings.Token, Type: controlStatus})
 	if err != nil {
 		if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -201,7 +204,7 @@ func launchDaemon(dir string) error {
 	return command.Process.Release()
 }
 
-func register(settings Settings, dir, name string, port int) (controlResponse, net.Conn, error) {
+func register(ctx context.Context, settings Settings, dir, name string, port int) (controlResponse, *controlConnection, error) {
 	request := controlRequest{Token: settings.Token, Type: controlRegister, Subdomain: name, Port: port}
 	address := controlAddress(dir)
 	if settings.Domain != "" {
@@ -215,7 +218,10 @@ func register(settings Settings, dir, name string, port int) (controlResponse, n
 	deadline := time.Now().Add(5 * time.Second)
 	var lastLaunch time.Time
 	for time.Now().Before(deadline) {
-		response, conn, err := sendControl(address, request)
+		if err := ctx.Err(); err != nil {
+			return controlResponse{}, nil, err
+		}
+		response, conn, err := sendControlContext(ctx, address, request)
 		if err == nil {
 			if !response.Retry {
 				return response, conn, nil
@@ -231,7 +237,15 @@ func register(settings Settings, dir, name string, port int) (controlResponse, n
 		} else {
 			return controlResponse{}, nil, err
 		}
-		time.Sleep(100 * time.Millisecond)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return controlResponse{}, nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	return controlResponse{}, nil, fmt.Errorf("the daemon did not start; check %s", filepath.Join(dir, "daemon.log"))
 }
@@ -241,11 +255,11 @@ func route(args []string) error {
 	if err != nil {
 		return err
 	}
-	values, err := parseOptions(args[1:], "--subdomain")
+	options, err := parseStartupOptions(args[1:], false)
 	if err != nil {
 		return err
 	}
-	name := values["--subdomain"]
+	name := options.Subdomain
 	if name == "" {
 		random := make([]byte, 4)
 		if _, err := rand.Read(random); err != nil {
@@ -257,40 +271,23 @@ func route(args []string) error {
 	if err != nil {
 		return err
 	}
-	lock, err := lockSettingsDir()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	settings, group, err := acquireRouteSessions(ctx, []routeSpec{{Subdomain: name, Port: port}})
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
 		return err
 	}
-	settings, dir, err := loadSettings()
-	if err != nil {
-		lock.Close()
-		return err
-	}
-	response, conn, err := register(settings, dir, name, port)
-	lock.Close()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if !response.OK {
-		return errors.New(response.Error)
-	}
-	fmt.Printf("%s → 127.0.0.1:%d\n", response.URL, port)
+	defer group.Close()
+	session := group.Routes()[0]
+	fmt.Printf("%s → 127.0.0.1:%d\n", session.URL(), session.Spec().Port)
 	if settings.Domain != "" {
 		fmt.Println("Cloudflare may need a moment to establish the connection.")
 	}
 	fmt.Println("Press Ctrl+C to stop this route.")
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
-	disconnected := make(chan struct{}, 1)
-	go func() { io.Copy(io.Discard, conn); disconnected <- struct{}{} }()
-	select {
-	case <-signals:
-		return nil
-	case <-disconnected:
-		return errors.New("the connection to the local daemon was interrupted")
-	}
+	return group.Wait()
 }
 
 func runDaemon() error {
