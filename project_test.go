@@ -106,7 +106,11 @@ func TestProjectConfigSelectionUsesCurrentDirectoryWithoutChangingIt(t *testing.
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(original) })
-	cwd := t.TempDir()
+	cwdTarget := t.TempDir()
+	cwd := filepath.Join(t.TempDir(), "cwd")
+	if err := os.Symlink(cwdTarget, cwd); err != nil {
+		t.Fatal(err)
+	}
 	other := t.TempDir()
 	writeProject := func(path, name string) {
 		t.Helper()
@@ -122,6 +126,10 @@ func TestProjectConfigSelectionUsesCurrentDirectoryWithoutChangingIt(t *testing.
 	if err := os.Chdir(cwd); err != nil {
 		t.Fatal(err)
 	}
+	wantCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, test := range []struct {
 		path string
@@ -134,7 +142,7 @@ func TestProjectConfigSelectionUsesCurrentDirectoryWithoutChangingIt(t *testing.
 		if len(routes) != 1 || routes[0].Subdomain != test.name {
 			t.Fatalf("config %q routes = %#v", test.path, routes)
 		}
-		if current, err := os.Getwd(); err != nil || current != cwd {
+		if current, err := os.Getwd(); err != nil || current != wantCWD {
 			t.Fatalf("working directory changed to %q, %v", current, err)
 		}
 	}
