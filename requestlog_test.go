@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -315,12 +316,17 @@ func TestRequestLogsPreserveSSEFlushAndCompleteAfterStream(t *testing.T) {
 	}
 	defer owner.Close()
 	observer := observeRegisteredRoute(t, daemon, settings, registered, "events")
-	request, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/stream", daemon.RouterPort), nil)
+	releaseStream := sync.OnceFunc(func() { close(release) })
+	defer releaseStream()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/stream", daemon.RouterPort), nil)
 	request.Host = "events.localhost"
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer response.Body.Close()
 	first := make([]byte, len("data: first\n\n"))
 	if _, err := io.ReadFull(response.Body, first); err != nil || string(first) != "data: first\n\n" {
 		t.Fatalf("first SSE event = %q, %v", first, err)
@@ -330,20 +336,29 @@ func TestRequestLogsPreserveSSEFlushAndCompleteAfterStream(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("backend did not flush the first SSE event")
 	}
+	heldSince := time.Now()
 	observer.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
 	if frame, err := observer.readFrame(); err == nil {
 		t.Fatalf("SSE completed before stream end: %q", frame)
+	} else {
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Fatalf("waiting for SSE completion: %v", err)
+		}
 	}
 	observer.SetReadDeadline(time.Time{})
-	close(release)
+	heldFor := time.Since(heldSince)
+	releaseStream()
 	rest, err := io.ReadAll(response.Body)
-	response.Body.Close()
 	if err != nil || string(rest) != "data: second\n\n" {
 		t.Fatalf("remaining SSE data = %q, %v", rest, err)
 	}
 	event := readRequestLogEvent(t, observer)
 	if event.Status != http.StatusOK || event.Path != "/stream" {
 		t.Fatalf("event = %+v", event)
+	}
+	if event.DurationMicros < heldFor.Microseconds() {
+		t.Fatalf("SSE duration = %d us, shorter than its %v release barrier", event.DurationMicros, heldFor)
 	}
 	observer.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
 	if frame, err := observer.readFrame(); err == nil {
@@ -695,8 +710,8 @@ func TestRequestLogObservationRequiresAuthAndExactInstance(t *testing.T) {
 	observer := observeRegisteredRoute(t, daemon, settings, registered, "bound")
 	owner.Close()
 	observer.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := observer.readFrame(); err == nil {
-		t.Fatal("observer survived removal of its route instance")
+	if _, err := observer.readFrame(); !errors.Is(err, io.EOF) {
+		t.Fatalf("observer after route removal: want EOF, got %v", err)
 	}
 
 	var replacement controlResponse
