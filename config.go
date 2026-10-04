@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -106,11 +105,11 @@ func loadSettings() (Settings, string, error) {
 	file := filepath.Join(dir, "settings.json")
 	data, err := os.ReadFile(file)
 	if errors.Is(err, os.ErrNotExist) {
-		secret := make([]byte, 32)
-		if _, err := rand.Read(secret); err != nil {
-			return Settings{}, "", err
+		secret, randomErr := randomHex(32)
+		if randomErr != nil {
+			return Settings{}, "", randomErr
 		}
-		initial := Settings{Token: hex.EncodeToString(secret), RouterPort: defaultRouterPort}
+		initial := Settings{Token: secret, RouterPort: defaultRouterPort}
 		initialData, _ := json.MarshalIndent(initial, "", "  ")
 		var created *os.File
 		created, err = os.CreateTemp(dir, "settings-init-*.tmp")

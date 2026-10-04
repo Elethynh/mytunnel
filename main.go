@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -261,11 +259,10 @@ func route(args []string) error {
 	}
 	name := options.Subdomain
 	if name == "" {
-		random := make([]byte, 4)
-		if _, err := rand.Read(random); err != nil {
+		name, err = randomHex(4)
+		if err != nil {
 			return err
 		}
-		name = hex.EncodeToString(random)
 	}
 	name, err = normalizeSubdomain(name)
 	if err != nil {

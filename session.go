@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sync"
 )
 
@@ -221,14 +222,7 @@ func runAcquiredRouteSessions(settings Settings, group *routeSessionGroup, outpu
 
 func hasCapabilities(available, required []string) bool {
 	for _, requirement := range required {
-		found := false
-		for _, capability := range available {
-			if capability == requirement {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(available, requirement) {
 			return false
 		}
 	}
