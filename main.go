@@ -273,21 +273,14 @@ func route(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	settings, group, err := acquireRouteSessions(ctx, []routeSpec{{Subdomain: name, Port: port}})
+	err = runRouteSessions(ctx, []routeSpec{{Subdomain: name, Port: port}}, os.Stdout, newReadinessProbe())
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
 		return err
 	}
-	defer group.Close()
-	session := group.Routes()[0]
-	fmt.Printf("%s → 127.0.0.1:%d\n", session.URL(), session.Spec().Port)
-	if settings.Domain != "" {
-		fmt.Println("Cloudflare may need a moment to establish the connection.")
-	}
-	fmt.Println("Press Ctrl+C to stop this route.")
-	return group.Wait()
+	return nil
 }
 
 func runDaemon() error {

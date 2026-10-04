@@ -41,12 +41,13 @@ type Daemon struct {
 }
 
 type routeTarget struct {
-	id    string
-	port  int
-	proxy *httputil.ReverseProxy
+	id        string
+	port      int
+	readiness routeReadiness
+	proxy     *httputil.ReverseProxy
 }
 
-func newRouteTarget(id string, port int) *routeTarget {
+func newRouteTarget(id string, port int, readiness routeReadiness) *routeTarget {
 	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", port)}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -55,7 +56,7 @@ func newRouteTarget(id string, port int) *routeTarget {
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "The local service is not responding.", http.StatusBadGateway)
 	}
-	return &routeTarget{id: id, port: port, proxy: proxy}
+	return &routeTarget{id: id, port: port, readiness: readiness, proxy: proxy}
 }
 
 func startDaemon(settings Settings, dir string, idleAfter time.Duration) (*Daemon, error) {
@@ -162,6 +163,12 @@ func (d *Daemon) proxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "This subdomain is not active.", http.StatusNotFound)
 		return
 	}
+	if r.Method == http.MethodGet && r.URL.Path == target.readiness.Path && r.URL.RawQuery == "" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, target.readiness.Proof)
+		return
+	}
 	target.proxy.ServeHTTP(w, r)
 }
 
@@ -232,12 +239,22 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		d.reply(conn, controlResponse{Error: err.Error()})
 		return
 	}
-	routeIDBytes := make([]byte, 16)
-	if _, err := rand.Read(routeIDBytes); err != nil {
+	routeID, err := randomHex(16)
+	if err != nil {
 		d.reply(conn, controlResponse{Error: "Could not create a route instance."})
 		return
 	}
-	routeID := hex.EncodeToString(routeIDBytes)
+	challenge, err := randomHex(16)
+	if err != nil {
+		d.reply(conn, controlResponse{Error: "Could not create a readiness challenge."})
+		return
+	}
+	proof, err := randomHex(16)
+	if err != nil {
+		d.reply(conn, controlResponse{Error: "Could not create a readiness challenge."})
+		return
+	}
+	readiness := routeReadiness{Path: "/.mytunnel/readiness/" + challenge, Proof: proof}
 	d.mu.Lock()
 	if d.stopping || d.closed {
 		d.mu.Unlock()
@@ -254,18 +271,27 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		d.reply(conn, controlResponse{Error: "Cannot forward the router port to itself."})
 		return
 	}
-	d.routes[name] = newRouteTarget(routeID, request.Port)
+	d.routes[name] = newRouteTarget(routeID, request.Port, readiness)
 	owned = name
 	d.resetIdleLocked()
 	d.mu.Unlock()
 	address := routeURL(name, d.settings.Domain, d.RouterPort)
 	if err := d.reply(conn, controlResponse{
 		OK: true, URL: address, RouteID: routeID, Capabilities: daemonCapabilities,
+		ReadinessPath: readiness.Path, ReadinessProof: readiness.Proof,
 	}); err != nil {
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
 	io.Copy(io.Discard, reader)
+}
+
+func randomHex(bytes int) (string, error) {
+	value := make([]byte, bytes)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
 }
 
 func (d *Daemon) reply(conn net.Conn, response controlResponse) error {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -380,6 +382,104 @@ func TestDaemonRoutesAndReleasesSessions(t *testing.T) {
 	}
 	if code, body := get("two.localhost"); code != 200 || body != "two" {
 		t.Fatalf("two after first closed: %d %q", code, body)
+	}
+}
+
+func TestDaemonServesRouteScopedReadinessWithoutBackendTraffic(t *testing.T) {
+	var backendRequests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendRequests.Add(1)
+		fmt.Fprintf(w, "%s:%s", r.Method, r.URL.Path)
+	}))
+	defer backend.Close()
+	settings := Settings{Token: strings.Repeat("d", 64), Domain: "example.com"}
+	daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+
+	registered, owner, err := sendControl(daemon.socketPath, controlRequest{
+		Token: settings.Token, Type: controlRegister, Subdomain: "proof", Port: serverPort(backend),
+	})
+	if err != nil || !registered.OK {
+		t.Fatalf("register: %+v, %v", registered, err)
+	}
+	if registered.ReadinessPath == "" || registered.ReadinessProof == "" || registered.ReadinessPath == registered.ReadinessProof {
+		t.Fatalf("readiness challenge = %q, proof = %q", registered.ReadinessPath, registered.ReadinessProof)
+	}
+	challenge := strings.TrimPrefix(registered.ReadinessPath, "/.mytunnel/readiness/")
+	if len(challenge) != 32 || len(registered.ReadinessProof) != 32 {
+		t.Fatalf("readiness entropy lengths = %d and %d", len(challenge), len(registered.ReadinessProof))
+	}
+	if _, err := hex.DecodeString(challenge); err != nil {
+		t.Fatalf("challenge encoding: %v", err)
+	}
+	if _, err := hex.DecodeString(registered.ReadinessProof); err != nil {
+		t.Fatalf("proof encoding: %v", err)
+	}
+
+	request := func(method, host, path string) (int, string, http.Header) {
+		req, _ := http.NewRequest(method, fmt.Sprintf("http://127.0.0.1:%d%s", daemon.RouterPort, path), nil)
+		req.Host = host
+		response, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body), response.Header
+	}
+	code, body, headers := request(http.MethodGet, "proof.example.com", registered.ReadinessPath)
+	if code != http.StatusOK || body != registered.ReadinessProof {
+		t.Fatalf("proof response = %d %q", code, body)
+	}
+	if headers.Get("Cache-Control") != "no-store" {
+		t.Fatalf("cache control = %q", headers.Get("Cache-Control"))
+	}
+	if got := backendRequests.Load(); got != 0 {
+		t.Fatalf("backend readiness requests = %d", got)
+	}
+
+	if code, body, _ := request(http.MethodHead, "proof.example.com", registered.ReadinessPath); code != 200 || body != "" {
+		t.Fatalf("ordinary HEAD = %d %q", code, body)
+	}
+	if code, body, _ := request(http.MethodGet, "proof.example.com", "/ordinary"); code != 200 || body != "GET:/ordinary" {
+		t.Fatalf("ordinary GET = %d %q", code, body)
+	}
+	if got := backendRequests.Load(); got != 2 {
+		t.Fatalf("backend ordinary requests = %d", got)
+	}
+	if code, _, _ := request(http.MethodGet, "other.example.com", registered.ReadinessPath); code != http.StatusNotFound {
+		t.Fatalf("other host status = %d", code)
+	}
+
+	owner.Close()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if code, _, _ := request(http.MethodGet, "proof.example.com", registered.ReadinessPath); code == http.StatusNotFound {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expired route instance still served readiness")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	replacement, replacementOwner, err := sendControl(daemon.socketPath, controlRequest{
+		Token: settings.Token, Type: controlRegister, Subdomain: "proof", Port: serverPort(backend),
+	})
+	if err != nil || !replacement.OK {
+		t.Fatalf("replacement register: %+v, %v", replacement, err)
+	}
+	defer replacementOwner.Close()
+	if replacement.ReadinessPath == registered.ReadinessPath || replacement.ReadinessProof == registered.ReadinessProof {
+		t.Fatal("replacement route reused the old readiness challenge")
+	}
+	if code, body, _ := request(http.MethodGet, "proof.example.com", registered.ReadinessPath); code != http.StatusOK || body == registered.ReadinessProof {
+		t.Fatalf("stale readiness response = %d %q", code, body)
+	}
+	if code, body, _ := request(http.MethodGet, "proof.example.com", replacement.ReadinessPath); code != http.StatusOK || body != replacement.ReadinessProof {
+		t.Fatalf("replacement readiness response = %d %q", code, body)
 	}
 }
 

@@ -2,10 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -31,7 +37,10 @@ func newFakeRouteSession(name string) *fakeRouteSession {
 func (s *fakeRouteSession) Spec() routeSpec    { return s.spec }
 func (s *fakeRouteSession) URL() string        { return "http://" + s.spec.Subdomain + ".localhost" }
 func (s *fakeRouteSession) InstanceID() string { return s.spec.Subdomain + "-id" }
-func (s *fakeRouteSession) Wait() error        { return <-s.wait }
+func (s *fakeRouteSession) Readiness() routeReadiness {
+	return routeReadiness{Path: "/.mytunnel/readiness/" + s.spec.Subdomain, Proof: s.spec.Subdomain + "-proof"}
+}
+func (s *fakeRouteSession) Wait() error { return <-s.wait }
 func (s *fakeRouteSession) Close() error {
 	s.once.Do(func() {
 		close(s.closed)
@@ -154,6 +163,56 @@ func TestOldDaemonIsRejectedBeforeRegistration(t *testing.T) {
 	select {
 	case request := <-requests:
 		t.Fatalf("old daemon received feature registration: %s", request.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestPublicStartupRequiresReadinessCapability(t *testing.T) {
+	dir := socketTestDir(t)
+	t.Setenv("MYTUNNEL_HOME", dir)
+	credentials := filepath.Join(dir, "tunnel.json")
+	if err := os.WriteFile(credentials, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	settings := Settings{
+		Token: strings.Repeat("7", 64), RouterPort: defaultRouterPort,
+		Domain: "example.com", Tunnel: "tunnel-id", Credentials: credentials,
+	}
+	if err := saveSettings(settings, dir); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", controlAddress(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requests := make(chan controlRequest, 2)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			var request controlRequest
+			_ = json.NewDecoder(conn).Decode(&request)
+			requests <- request
+			_ = json.NewEncoder(conn).Encode(controlResponse{
+				OK: true, Capabilities: []string{capabilityRouteInstances},
+			})
+			conn.Close()
+		}
+	}()
+
+	_, _, err = acquireRouteSessions(context.Background(), []routeSpec{{Subdomain: "demo", Port: 3000}})
+	if err == nil || !strings.Contains(err.Error(), "restart") {
+		t.Fatalf("acquire error = %v", err)
+	}
+	if request := <-requests; request.Type != controlStatus {
+		t.Fatalf("first request = %s", request.Type)
+	}
+	select {
+	case request := <-requests:
+		t.Fatalf("old daemon received public registration: %s", request.Type)
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -298,6 +357,134 @@ func TestAcquisitionReleasesSettingsLockWhileSessionRuns(t *testing.T) {
 		t.Fatalf("settings lock remained held: %v", err)
 	}
 	lock.Close()
+}
+
+func TestReadinessTimeoutKeepsAcquiredRouteActiveUntilCancellation(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "active")
+	}))
+	defer backend.Close()
+	readinessServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "wrong-proof")
+	}))
+	defer readinessServer.Close()
+	settings := Settings{Token: strings.Repeat("8", 64), Domain: "example.com"}
+	daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	response, connection, err := sendControl(daemon.socketPath, controlRequest{
+		Token: settings.Token, Type: controlRegister, Subdomain: "ready", Port: serverPort(backend),
+	})
+	if err != nil || !response.OK {
+		t.Fatalf("register: %+v, %v", response, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	group := newRouteSessionGroup(ctx)
+	group.add(&ownedRouteSession{
+		spec: routeSpec{Subdomain: "ready", Port: serverPort(backend)}, address: readinessServer.URL,
+		instance: response.RouteID, readiness: routeReadiness{Path: response.ReadinessPath, Proof: response.ReadinessProof},
+		connection: connection,
+	})
+	var outputBuffer bytes.Buffer
+	output := newRouteOutput(&outputBuffer, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- runAcquiredRouteSessions(settings, group, output, readinessProbe{
+			client: readinessServer.Client(), overallTimeout: 40 * time.Millisecond,
+			requestTimeout: 20 * time.Millisecond, retryDelay: 5 * time.Millisecond,
+		})
+	}()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("runner stopped after timeout: %v", err)
+	default:
+	}
+	request, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/", daemon.RouterPort), nil)
+	request.Host = "ready.example.com"
+	result, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(result.Body)
+	result.Body.Close()
+	if result.StatusCode != http.StatusOK || string(body) != "active" {
+		t.Fatalf("route after timeout = %d %q", result.StatusCode, body)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runner cancellation was not prompt")
+	}
+	output.close()
+	<-output.done
+	text := outputBuffer.String()
+	if !strings.Contains(text, "Checking public reachability: ") ||
+		!strings.Contains(text, "public reachability was not confirmed") ||
+		!strings.Contains(text, "DNS destination and daemon.log") {
+		t.Fatalf("readiness output = %q", text)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		request, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/", daemon.RouterPort), nil)
+		request.Host = "ready.example.com"
+		response, requestErr := http.DefaultClient.Do(request)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		response.Body.Close()
+		if response.StatusCode == http.StatusNotFound {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancellation did not release the acquired route")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestLocalSessionReportsRegistrationWithoutPublicProbe(t *testing.T) {
+	dir := socketTestDir(t)
+	t.Setenv("MYTUNNEL_HOME", dir)
+	settings := Settings{Token: strings.Repeat("9", 64), RouterPort: defaultRouterPort}
+	if err := saveSettings(settings, dir); err != nil {
+		t.Fatal(err)
+	}
+	daemonSettings := settings
+	daemonSettings.RouterPort = 0
+	daemon, err := startDaemon(daemonSettings, dir, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	var buffer bytes.Buffer
+	output := newRouteOutput(&buffer, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	loaded, group, err := acquireRouteSessionsWithOutput(ctx, []routeSpec{{Subdomain: "local", Port: 3000}}, output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- runAcquiredRouteSessions(loaded, group, output, newReadinessProbe()) }()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	output.close()
+	<-output.done
+	text := buffer.String()
+	if !strings.Contains(text, "Local route registered: http://local.localhost:") {
+		t.Fatalf("output = %q", text)
+	}
+	if strings.Contains(text, "Checking public reachability") {
+		t.Fatalf("local mode started a public probe: %q", text)
+	}
 }
 
 func TestControlConnectionRetainsCoalescedFrames(t *testing.T) {

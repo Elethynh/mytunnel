@@ -18,7 +18,10 @@ const (
 	controlRegister controlRequestType = "register"
 )
 
-const capabilityRouteInstances = "route-instances-v1"
+const (
+	capabilityRouteInstances = "route-instances-v1"
+	capabilityReadiness      = "public-readiness-v1"
+)
 
 type controlRequest struct {
 	Token     string             `json:"token"`
@@ -33,14 +36,16 @@ type routeStatus struct {
 }
 
 type controlResponse struct {
-	OK           bool          `json:"ok"`
-	Error        string        `json:"error,omitempty"`
-	URL          string        `json:"url,omitempty"`
-	Domain       string        `json:"domain,omitempty"`
-	Retry        bool          `json:"retry,omitempty"`
-	Routes       []routeStatus `json:"routes,omitempty"`
-	Capabilities []string      `json:"capabilities,omitempty"`
-	RouteID      string        `json:"routeId,omitempty"`
+	OK             bool          `json:"ok"`
+	Error          string        `json:"error,omitempty"`
+	URL            string        `json:"url,omitempty"`
+	Domain         string        `json:"domain,omitempty"`
+	Retry          bool          `json:"retry,omitempty"`
+	Routes         []routeStatus `json:"routes,omitempty"`
+	Capabilities   []string      `json:"capabilities,omitempty"`
+	RouteID        string        `json:"routeId,omitempty"`
+	ReadinessPath  string        `json:"readinessPath,omitempty"`
+	ReadinessProof string        `json:"readinessProof,omitempty"`
 }
 
 type controlConnection struct {

@@ -9,7 +9,7 @@ import (
 	"sync"
 )
 
-var daemonCapabilities = []string{capabilityRouteInstances}
+var daemonCapabilities = []string{capabilityRouteInstances, capabilityReadiness}
 
 type routeSpec struct {
 	Subdomain string
@@ -20,21 +20,51 @@ type routeSession interface {
 	Spec() routeSpec
 	URL() string
 	InstanceID() string
+	Readiness() routeReadiness
 	Wait() error
 	Close() error
 }
+
+type routeReadiness struct {
+	Path  string
+	Proof string
+}
+
+type routeOutput struct {
+	lines chan string
+	done  chan struct{}
+}
+
+func newRouteOutput(writer io.Writer, routes int) *routeOutput {
+	output := &routeOutput{lines: make(chan string, routes*3+2), done: make(chan struct{})}
+	go func() {
+		defer close(output.done)
+		for line := range output.lines {
+			_, _ = fmt.Fprintln(writer, line)
+		}
+	}()
+	return output
+}
+
+func (o *routeOutput) enqueue(format string, values ...any) {
+	o.lines <- fmt.Sprintf(format, values...)
+}
+
+func (o *routeOutput) close() { close(o.lines) }
 
 type ownedRouteSession struct {
 	spec       routeSpec
 	address    string
 	instance   string
+	readiness  routeReadiness
 	connection *controlConnection
 }
 
-func (s *ownedRouteSession) Spec() routeSpec    { return s.spec }
-func (s *ownedRouteSession) URL() string        { return s.address }
-func (s *ownedRouteSession) InstanceID() string { return s.instance }
-func (s *ownedRouteSession) Close() error       { return s.connection.Close() }
+func (s *ownedRouteSession) Spec() routeSpec           { return s.spec }
+func (s *ownedRouteSession) URL() string               { return s.address }
+func (s *ownedRouteSession) InstanceID() string        { return s.instance }
+func (s *ownedRouteSession) Readiness() routeReadiness { return s.readiness }
+func (s *ownedRouteSession) Close() error              { return s.connection.Close() }
 
 func (s *ownedRouteSession) Wait() error {
 	_, err := io.Copy(io.Discard, s.connection)
@@ -96,6 +126,10 @@ func (g *routeSessionGroup) Wait() error {
 }
 
 func acquireRouteSessions(ctx context.Context, specs []routeSpec, requiredCapabilities ...string) (Settings, *routeSessionGroup, error) {
+	return acquireRouteSessionsWithOutput(ctx, specs, nil, requiredCapabilities...)
+}
+
+func acquireRouteSessionsWithOutput(ctx context.Context, specs []routeSpec, output *routeOutput, requiredCapabilities ...string) (Settings, *routeSessionGroup, error) {
 	requiredCapabilities = append([]string{capabilityRouteInstances}, requiredCapabilities...)
 	lock, err := lockSettingsDirContext(ctx)
 	if err != nil {
@@ -105,6 +139,9 @@ func acquireRouteSessions(ctx context.Context, specs []routeSpec, requiredCapabi
 	settings, dir, err := loadSettings()
 	if err != nil {
 		return Settings{}, nil, err
+	}
+	if settings.Domain != "" {
+		requiredCapabilities = append(requiredCapabilities, capabilityReadiness)
 	}
 	current, err := probeStatusContext(ctx, settings, dir)
 	if err != nil {
@@ -128,16 +165,58 @@ func acquireRouteSessions(ctx context.Context, specs []routeSpec, requiredCapabi
 			group.Close()
 			return Settings{}, nil, errors.New(response.Error)
 		}
-		if response.RouteID == "" || !hasCapabilities(response.Capabilities, requiredCapabilities) {
+		if response.RouteID == "" || !hasCapabilities(response.Capabilities, requiredCapabilities) ||
+			(settings.Domain != "" && (response.ReadinessPath == "" || response.ReadinessProof == "")) {
 			connection.Close()
 			group.Close()
 			return Settings{}, nil, oldDaemonError()
 		}
-		group.add(&ownedRouteSession{
-			spec: spec, address: response.URL, instance: response.RouteID, connection: connection,
-		})
+		session := &ownedRouteSession{
+			spec: spec, address: response.URL, instance: response.RouteID,
+			readiness: routeReadiness{Path: response.ReadinessPath, Proof: response.ReadinessProof}, connection: connection,
+		}
+		group.add(session)
+		if output != nil {
+			mode := "Local"
+			if settings.Domain != "" {
+				mode = "Public"
+			}
+			output.enqueue("%s route registered: %s → 127.0.0.1:%d", mode, session.URL(), session.Spec().Port)
+		}
 	}
 	return settings, group, nil
+}
+
+func runRouteSessions(ctx context.Context, specs []routeSpec, writer io.Writer, probe readinessProbe) error {
+	output := newRouteOutput(writer, len(specs))
+	defer output.close()
+	settings, group, err := acquireRouteSessionsWithOutput(ctx, specs, output)
+	if err != nil {
+		return err
+	}
+	defer group.Close()
+	return runAcquiredRouteSessions(settings, group, output, probe)
+}
+
+func runAcquiredRouteSessions(settings Settings, group *routeSessionGroup, output *routeOutput, probe readinessProbe) error {
+	routes := group.Routes()
+	if settings.Domain != "" {
+		for _, route := range routes {
+			output.enqueue("Checking public reachability: %s", route.URL())
+		}
+		for result := range probePublicRoutes(group.Context(), routes, probe) {
+			switch result.Status {
+			case readinessConfirmed:
+				output.enqueue("Public reachability confirmed: %s", result.Route.URL())
+			case readinessTimedOut:
+				output.enqueue("Warning: public reachability was not confirmed for %s within 30 seconds; check the hostname's DNS destination and daemon.log. The route remains active.", result.Route.URL())
+			}
+		}
+	}
+	if group.Context().Err() == nil {
+		output.enqueue("Press Ctrl+C to stop.")
+	}
+	return group.Wait()
 }
 
 func hasCapabilities(available, required []string) bool {
