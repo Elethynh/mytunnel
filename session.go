@@ -99,14 +99,14 @@ func (o *routeOutput) enqueue(format string, values ...any) {
 	o.lines <- fmt.Sprintf(format, values...)
 }
 
-func (o *routeOutput) tryEnqueueLog(format string, values ...any) bool {
+func (o *routeOutput) tryEnqueueLog(line string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.closed {
 		return false
 	}
 	select {
-	case o.logs <- fmt.Sprintf(format, values...):
+	case o.logs <- line:
 		return true
 	default:
 		o.logDrops++

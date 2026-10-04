@@ -96,10 +96,8 @@ func marshalRequestLogEvent(event requestLogEvent) []byte {
 	if len(frame) <= controlFrameLimit {
 		return frame
 	}
-	fallback, _ := json.Marshal(requestLogEvent{
-		Type: event.Type, Route: event.Route, Method: event.Method,
-		Path: "...", Status: event.Status, DurationMicros: event.DurationMicros, Dropped: event.Dropped,
-	})
+	event.Path = "..."
+	fallback, _ := json.Marshal(event)
 	return append(fallback, '\n')
 }
 
@@ -203,7 +201,7 @@ func newRequestLogDisplay(parent context.Context, output *routeOutput) *requestL
 }
 
 func (d *requestLogDisplay) enqueue(line string) {
-	d.output.tryEnqueueLog("%s", line)
+	d.output.tryEnqueueLog(line)
 }
 
 func (d *requestLogDisplay) observe(address string, settings Settings, route routeSession) {

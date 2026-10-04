@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -308,13 +309,7 @@ func waitForDaemonRoutes(t *testing.T, daemon *Daemon, names ...string) {
 		if len(got) == len(names) {
 			allPresent := true
 			for _, name := range names {
-				found := false
-				for _, actual := range got {
-					if actual == name {
-						found = true
-						break
-					}
-				}
+				found := slices.Contains(got, name)
 				allPresent = allPresent && found
 			}
 			if allPresent {
