@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/rand"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type Settings struct {
@@ -104,11 +105,11 @@ func loadSettings() (Settings, string, error) {
 	file := filepath.Join(dir, "settings.json")
 	data, err := os.ReadFile(file)
 	if errors.Is(err, os.ErrNotExist) {
-		secret := make([]byte, 32)
-		if _, err := rand.Read(secret); err != nil {
-			return Settings{}, "", err
+		secret, randomErr := randomHex(32)
+		if randomErr != nil {
+			return Settings{}, "", randomErr
 		}
-		initial := Settings{Token: hex.EncodeToString(secret), RouterPort: defaultRouterPort}
+		initial := Settings{Token: secret, RouterPort: defaultRouterPort}
 		initialData, _ := json.MarshalIndent(initial, "", "  ")
 		var created *os.File
 		created, err = os.CreateTemp(dir, "settings-init-*.tmp")
@@ -152,6 +153,10 @@ func loadSettings() (Settings, string, error) {
 }
 
 func lockSettingsDir() (*os.File, error) {
+	return lockSettingsDirContext(context.Background())
+}
+
+func lockSettingsDirContext(ctx context.Context) (*os.File, error) {
 	dir, err := prepareSettingsDir()
 	if err != nil {
 		return nil, err
@@ -160,11 +165,28 @@ func lockSettingsDir() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		file.Close()
-		return nil, err
+	retry := time.NewTicker(25 * time.Millisecond)
+	defer retry.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			file.Close()
+			return nil, err
+		}
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return file, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			file.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			file.Close()
+			return nil, ctx.Err()
+		case <-retry.C:
+		}
 	}
-	return file, nil
 }
 
 func saveSettings(settings Settings, dir string) error {

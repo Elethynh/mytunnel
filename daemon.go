@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,20 +41,83 @@ type Daemon struct {
 }
 
 type routeTarget struct {
-	port  int
-	proxy *httputil.ReverseProxy
+	id        string
+	label     string
+	port      int
+	readiness routeReadiness
+	proxy     *httputil.ReverseProxy
+	mu        sync.RWMutex
+	observers map[*requestLogObserver]struct{}
 }
 
-func newRouteTarget(port int) *routeTarget {
+func newRouteTarget(id, label string, port int, readiness routeReadiness) *routeTarget {
 	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", port)}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	proxy.Transport = transport
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if state := requestLogStateFrom(response.Request); state != nil {
+			state.recordStatus(response.StatusCode)
+		}
+		return nil
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, request *http.Request, _ error) {
+		if state := requestLogStateFrom(request); state != nil {
+			state.recordStatus(http.StatusBadGateway)
+		}
 		http.Error(w, "The local service is not responding.", http.StatusBadGateway)
 	}
-	return &routeTarget{port: port, proxy: proxy}
+	return &routeTarget{
+		id: id, label: label, port: port, readiness: readiness, proxy: proxy,
+		observers: make(map[*requestLogObserver]struct{}),
+	}
+}
+
+func (t *routeTarget) addObserver(observer *requestLogObserver) {
+	t.mu.Lock()
+	t.observers[observer] = struct{}{}
+	t.mu.Unlock()
+}
+
+func (t *routeTarget) removeObserver(observer *requestLogObserver) {
+	t.mu.Lock()
+	delete(t.observers, observer)
+	t.mu.Unlock()
+	observer.Close()
+}
+
+func (t *routeTarget) closeObservers() {
+	t.mu.Lock()
+	observers := make([]*requestLogObserver, 0, len(t.observers))
+	for observer := range t.observers {
+		observers = append(observers, observer)
+	}
+	t.observers = make(map[*requestLogObserver]struct{})
+	t.mu.Unlock()
+	for _, observer := range observers {
+		observer.Close()
+	}
+}
+
+func (t *routeTarget) hasObservers() bool {
+	t.mu.RLock()
+	hasObservers := len(t.observers) > 0
+	t.mu.RUnlock()
+	return hasObservers
+}
+
+func (t *routeTarget) publishRequest(metadata requestLogMetadata, state *requestLogState, started time.Time) {
+	event := requestLogEvent{
+		Type: requestLogEventType, Route: metadata.route, Method: metadata.method, Path: metadata.path,
+		Status: int(state.status.Load()), DurationMicros: time.Since(started).Microseconds(),
+	}
+	frame := marshalRequestLogEvent(event)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for observer := range t.observers {
+		observer.publish(frame)
+	}
 }
 
 func startDaemon(settings Settings, dir string, idleAfter time.Duration) (*Daemon, error) {
@@ -159,6 +224,21 @@ func (d *Daemon) proxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "This subdomain is not active.", http.StatusNotFound)
 		return
 	}
+	if r.Method == http.MethodGet && r.URL.Path == target.readiness.Path && r.URL.RawQuery == "" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, target.readiness.Proof)
+		return
+	}
+	if !target.hasObservers() {
+		target.proxy.ServeHTTP(w, r)
+		return
+	}
+	metadata := newRequestLogMetadata(target.label, r.Method, r.URL.EscapedPath())
+	state := &requestLogState{}
+	r = r.WithContext(context.WithValue(r.Context(), requestLogContextKey{}, state))
+	started := time.Now()
+	defer target.publishRequest(metadata, state, started)
 	target.proxy.ServeHTTP(w, r)
 }
 
@@ -184,19 +264,26 @@ func (d *Daemon) acceptControl() {
 
 func (d *Daemon) handleControl(conn net.Conn) {
 	var owned string
+	var ownedTarget *routeTarget
 	defer func() {
 		conn.Close()
 		d.mu.Lock()
 		delete(d.clients, conn)
 		if owned != "" {
-			delete(d.routes, owned)
+			if d.routes[owned] == ownedTarget {
+				delete(d.routes, owned)
+			}
 			d.resetIdleLocked()
 		}
 		d.mu.Unlock()
+		if ownedTarget != nil {
+			ownedTarget.closeObservers()
+		}
 	}()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	line, err := bufio.NewReader(io.LimitReader(conn, 4097)).ReadBytes('\n')
-	if err != nil || len(line) > 4096 {
+	reader := bufio.NewReaderSize(conn, 4096)
+	line, err := readControlFrame(reader)
+	if err != nil {
 		d.reply(conn, controlResponse{Error: "Invalid command."})
 		return
 	}
@@ -207,13 +294,32 @@ func (d *Daemon) handleControl(conn net.Conn) {
 	}
 	if request.Type == controlStatus {
 		d.mu.RLock()
-		response := controlResponse{OK: true, Domain: d.settings.Domain}
+		response := controlResponse{OK: true, Domain: d.settings.Domain, Capabilities: daemonCapabilities}
 		for name, target := range d.routes {
 			response.Routes = append(response.Routes, routeStatus{name, target.port})
 		}
 		d.mu.RUnlock()
 		sort.Slice(response.Routes, func(i, j int) bool { return response.Routes[i].Subdomain < response.Routes[j].Subdomain })
 		d.reply(conn, response)
+		return
+	}
+	if request.Type == controlObserve {
+		d.mu.RLock()
+		target := d.routes[request.Subdomain]
+		if target == nil || target.id != request.RouteID {
+			d.mu.RUnlock()
+			d.reply(conn, controlResponse{Error: "The route instance is not active."})
+			return
+		}
+		observer := newRequestLogObserver(conn, request.Subdomain)
+		target.addObserver(observer)
+		d.mu.RUnlock()
+		defer target.removeObserver(observer)
+		if err := d.reply(conn, controlResponse{OK: true, Capabilities: daemonCapabilities}); err != nil {
+			return
+		}
+		conn.SetReadDeadline(time.Time{})
+		observer.writeEvents()
 		return
 	}
 	if request.Type != controlRegister {
@@ -228,6 +334,22 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		d.reply(conn, controlResponse{Error: err.Error()})
 		return
 	}
+	routeID, err := randomHex(16)
+	if err != nil {
+		d.reply(conn, controlResponse{Error: "Could not create a route instance."})
+		return
+	}
+	challenge, err := randomHex(16)
+	if err != nil {
+		d.reply(conn, controlResponse{Error: "Could not create a readiness challenge."})
+		return
+	}
+	proof, err := randomHex(16)
+	if err != nil {
+		d.reply(conn, controlResponse{Error: "Could not create a readiness challenge."})
+		return
+	}
+	readiness := routeReadiness{Path: "/.mytunnel/readiness/" + challenge, Proof: proof}
 	d.mu.Lock()
 	if d.stopping || d.closed {
 		d.mu.Unlock()
@@ -244,16 +366,28 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		d.reply(conn, controlResponse{Error: "Cannot forward the router port to itself."})
 		return
 	}
-	d.routes[name] = newRouteTarget(request.Port)
+	ownedTarget = newRouteTarget(routeID, name, request.Port, readiness)
+	d.routes[name] = ownedTarget
 	owned = name
 	d.resetIdleLocked()
 	d.mu.Unlock()
 	address := routeURL(name, d.settings.Domain, d.RouterPort)
-	if err := d.reply(conn, controlResponse{OK: true, URL: address}); err != nil {
+	if err := d.reply(conn, controlResponse{
+		OK: true, URL: address, RouteID: routeID, Capabilities: daemonCapabilities,
+		ReadinessPath: readiness.Path, ReadinessProof: readiness.Proof,
+	}); err != nil {
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
-	io.Copy(io.Discard, conn)
+	io.Copy(io.Discard, reader)
+}
+
+func randomHex(bytes int) (string, error) {
+	value := make([]byte, bytes)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
 }
 
 func (d *Daemon) reply(conn net.Conn, response controlResponse) error {

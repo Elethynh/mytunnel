@@ -11,7 +11,7 @@ mytunnel 5173 --subdomain local-app
 # https://local-app.example.com → 127.0.0.1:5173
 ```
 
-One computer runs one shared `cloudflared` process and a local router. Each CLI command adds a route, keeps it alive, and removes it when you press Ctrl+C. Start another command to serve another port. A single wildcard DNS record covers every route, so starting a service requires no DNS changes or Cloudflare API calls.
+One computer runs one shared `cloudflared` process and a local router. Each startup command adds one or more routes, keeps them alive, and removes its routes when you press Ctrl+C. Start another command or use a project file to serve more ports. A single wildcard DNS record covers every route, so starting a service requires no DNS changes or Cloudflare API calls.
 
 Without a configured domain, the same commands work locally at `http://local-app.localhost:43187`.
 
@@ -31,12 +31,14 @@ Download an archive and `checksums.txt` from the [latest release](https://github
 Check the archive's SHA-256 against `checksums.txt` using `sha256sum` on Linux or `shasum -a 256` on macOS. For example, install the Linux x86-64 release with:
 
 ```sh
-tar -xzf mytunnel_0.1.0_linux_amd64.tar.gz
+tar -xzf mytunnel_0.2.0_linux_amd64.tar.gz
 mkdir -p "$HOME/.local/bin"
 install -m 0755 mytunnel "$HOME/.local/bin/mytunnel"
 ```
 
 Make sure `$HOME/.local/bin` is in your `PATH`. In zsh, run `rehash` if the new command is not found.
+
+Each archive also contains `LICENSE`, `README.md`, and `THIRD_PARTY_NOTICES.md`.
 
 ### Install with Go
 
@@ -84,6 +86,56 @@ curl -H 'Host: local-app.localhost' http://127.0.0.1:43187/
 
 Local mode is accessible only on your computer.
 
+## Start a project
+
+Add a `.mytunnel.json` file to a project when you want to start several routes together:
+
+```json
+{
+  "version": 1,
+  "routes": [
+    { "port": 5173, "subdomain": "local-app" },
+    { "port": 8080, "subdomain": "api" }
+  ]
+}
+```
+
+Start every route declared in the file:
+
+```sh
+mytunnel up
+```
+
+`mytunnel up` reads `.mytunnel.json` from the current directory. It does not search parent directories. Select an exact alternate path with `--config`:
+
+```sh
+mytunnel up --config ./config/dev.mytunnel.json
+```
+
+The version 1 schema accepts only `version` and `routes` at the top level, and only an explicit `port` and `subdomain` for every route. Unknown fields are rejected. The file does not contain credentials, domain setup, shell commands, or sharing preferences.
+
+The complete file is validated before any route starts. If registration later fails, mytunnel reports the failed route and releases only the routes acquired by that `up` command. Routes owned by other commands remain active.
+
+## Share URLs and inspect requests
+
+The startup flags work with both the port-first command and `up`. They are optional and can be combined:
+
+```sh
+mytunnel 5173 --subdomain local-app --open --copy --qr --logs
+mytunnel up --config ./config/dev.mytunnel.json --open --copy --qr --logs
+```
+
+- `--open` opens each local URL immediately. In public mode it opens a route only after public confirmation succeeds. A timed-out public route is not opened automatically.
+- `--copy` sends all registered URLs to the clipboard once, as one newline-separated payload in project-file order.
+- `--qr` prints a labelled terminal QR for each public URL. The QR is generated inside mytunnel, so no QR runtime program is required. In local mode, mytunnel keeps printing the ordinary URL and explains that a `localhost` URL cannot be reached from a phone.
+- `--logs` streams completed requests for only the routes owned by that command. Each line contains the route label, method, path, status, and duration, for example `[local-app] GET /products 200 12ms`.
+
+On macOS, `--open` uses `open` and `--copy` uses `pbcopy`. On Linux, opening uses `xdg-open`; copying uses `wl-copy` in a Wayland session or `xclip` in an X11 session. These helpers are optional. A missing helper, QR error, or failed sharing action produces a warning and leaves the routes active.
+
+Clipboard copying happens after registration, before public confirmation, and preserves the declared route order. Public QR codes are also printed at registration. Sharing flags never change the project file.
+
+Request logs omit query strings, headers, request and response bodies, credentials, and readiness probes. Metadata is escaped for safe terminal output, and request events are never written to `daemon.log`. A streaming request appears after its stream ends, when its final status and duration are known. Logging uses bounded queues so a slow terminal cannot delay HTTP or WebSocket traffic; mytunnel warns when events are dropped.
+
 ## Set up public HTTPS
 
 This requires a domain, a Cloudflare account, and `cloudflared` on the computer serving your applications. The domain can be registered with Cloudflare or another registrar.
@@ -114,7 +166,9 @@ This requires a domain, a Cloudflare account, and `cloudflared` on the computer 
    # https://local-app.example.com → 127.0.0.1:5173
    ```
 
-The local route is registered immediately. `cloudflared` may need a moment to connect to Cloudflare. Public HTTPS is available while your computer and CLI sessions are running. Once the tunnel stops, its DNS record remains.
+The local route is registered and printed immediately. `cloudflared` may need a moment to connect to Cloudflare. For every public route, mytunnel concurrently retries a route-specific HTTPS readiness URL for up to 30 seconds. Confirmation requires valid TLS, the exact requested hostname, and the proof created for that route invocation. It does not call your application or certify application health. A timeout prints an actionable warning and keeps the route active.
+
+Public HTTPS is available while your computer and CLI sessions are running. Once the tunnel stops, its DNS record remains.
 
 The router supports HTTP and WebSocket connections, and routes use one subdomain label such as `local-app.example.com`. These public services have no additional authentication. Some development servers check the HTTP Host header; allow your chosen public hostname explicitly in the application's server settings.
 
@@ -132,6 +186,8 @@ The first CLI session starts the shared daemon and, in public mode, `cloudflared
 
 Settings and daemon logs live in `~/.config/mytunnel/`, or `$XDG_CONFIG_HOME/mytunnel/`. The settings file and control socket have mode `0600`, and their directory has mode `0700`. Tunnel configuration is generated from the settings when the daemon starts. `MYTUNNEL_HOME` overrides the settings directory for development and isolated tests.
 
+The CLI and daemon negotiate feature support. If a newer CLI reports that the running daemon is from an older version, stop the active mytunnel commands you own and retry the new command. mytunnel does not forcibly kill the old daemon or unrelated sessions.
+
 ## Development and releases
 
 ```sh
@@ -140,16 +196,16 @@ go vet ./...
 go build .
 ```
 
-Tests cover first-time settings creation, validation, concurrent routes, session cleanup, public hostname routing, idle shutdown, and WebSocket upgrades. Tests run on Linux and macOS in GitHub Actions. A real public tunnel needs a configured Cloudflare account and domain to test end to end.
+Tests cover first-time settings creation, strict project files and rollback, concurrent route ownership, public readiness, URL sharing, bounded request logs, HTTP streaming, and WebSocket upgrades. GitHub Actions runs the race-enabled suite on Linux and macOS with current Go, plus a separate test and build with Go 1.22 and `GOTOOLCHAIN=local`. A real public tunnel needs a configured Cloudflare account and domain to test end to end.
 
 To build the four release archives and their SHA-256 checksums:
 
 ```sh
-./scripts/package-release.sh v0.1.0
-# dist/v0.1.0/
+./scripts/package-release.sh v0.2.0
+# dist/v0.2.0/
 ```
 
-Pushing a version tag such as `v0.1.0` runs the release workflow, repeats the checks, and publishes the archives to GitHub Releases.
+Pushing a version tag such as `v0.2.0` runs the release workflow, repeats the checks, and publishes the archives to GitHub Releases.
 
 ## License
 

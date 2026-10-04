@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -216,63 +218,83 @@ func TestStatusURLs(t *testing.T) {
 }
 
 func TestWebSocketUpgradePassesThrough(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		connection, buffered, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		defer connection.Close()
-		fmt.Fprint(buffered, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-		buffered.Flush()
-		payload := make([]byte, 4)
-		if _, err := io.ReadFull(buffered, payload); err != nil {
-			t.Error(err)
-			return
-		}
-		connection.Write(payload)
-	}))
-	defer backend.Close()
-	port := serverPort(backend)
-	settings := Settings{Token: strings.Repeat("e", 64)}
-	daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer daemon.Close()
-	response, route, err := sendControl(daemon.socketPath, controlRequest{Token: settings.Token, Type: controlRegister, Subdomain: "socket", Port: port})
-	if err != nil || !response.OK {
-		t.Fatalf("route: %+v, %v", response, err)
-	}
-	defer route.Close()
-	client, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", daemon.RouterPort))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	client.SetDeadline(time.Now().Add(2 * time.Second))
-	fmt.Fprint(client, "GET / HTTP/1.1\r\nHost: socket.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-	reader := bufio.NewReader(client)
-	status, err := reader.ReadString('\n')
-	if err != nil || !strings.Contains(status, "101") {
-		t.Fatalf("upgrade: %q, %v", status, err)
-	}
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if line == "\r\n" {
-			break
-		}
-	}
-	client.Write([]byte("ping"))
-	got := make([]byte, 4)
-	if _, err := io.ReadFull(reader, got); err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "ping" {
-		t.Fatalf("echo = %q", got)
+	for _, logs := range []bool{false, true} {
+		t.Run(fmt.Sprintf("logs=%t", logs), func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				connection, buffered, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer connection.Close()
+				fmt.Fprint(buffered, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+				buffered.Flush()
+				payload := make([]byte, 4)
+				if _, err := io.ReadFull(buffered, payload); err != nil {
+					t.Error(err)
+					return
+				}
+				connection.Write(payload)
+			}))
+			defer backend.Close()
+			settings := Settings{Token: strings.Repeat("e", 64)}
+			daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer daemon.Close()
+			response, route, err := sendControl(daemon.socketPath, controlRequest{
+				Token: settings.Token, Type: controlRegister, Subdomain: "socket", Port: serverPort(backend),
+			})
+			if err != nil || !response.OK {
+				t.Fatalf("route: %+v, %v", response, err)
+			}
+			defer route.Close()
+			var observer *controlConnection
+			if logs {
+				observer = observeRegisteredRoute(t, daemon, settings, response, "socket")
+			}
+			client, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", daemon.RouterPort))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			client.SetDeadline(time.Now().Add(2 * time.Second))
+			fmt.Fprint(client, "GET / HTTP/1.1\r\nHost: socket.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+			reader := bufio.NewReader(client)
+			status, err := reader.ReadString('\n')
+			if err != nil || !strings.Contains(status, "101") {
+				t.Fatalf("upgrade: %q, %v", status, err)
+			}
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatal(err)
+				}
+				if line == "\r\n" {
+					break
+				}
+			}
+			client.Write([]byte("ping"))
+			got := make([]byte, 4)
+			if _, err := io.ReadFull(reader, got); err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "ping" {
+				t.Fatalf("echo = %q", got)
+			}
+			client.Close()
+			if logs {
+				event := readRequestLogEvent(t, observer)
+				if event.Status != http.StatusSwitchingProtocols || event.Path != "/" {
+					t.Fatalf("WebSocket event = %+v", event)
+				}
+				observer.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+				if frame, err := observer.readFrame(); err == nil {
+					t.Fatalf("WebSocket emitted extra completion %q", frame)
+				}
+			}
+		})
 	}
 }
 
@@ -380,6 +402,104 @@ func TestDaemonRoutesAndReleasesSessions(t *testing.T) {
 	}
 	if code, body := get("two.localhost"); code != 200 || body != "two" {
 		t.Fatalf("two after first closed: %d %q", code, body)
+	}
+}
+
+func TestDaemonServesRouteScopedReadinessWithoutBackendTraffic(t *testing.T) {
+	var backendRequests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendRequests.Add(1)
+		fmt.Fprintf(w, "%s:%s", r.Method, r.URL.Path)
+	}))
+	defer backend.Close()
+	settings := Settings{Token: strings.Repeat("d", 64), Domain: "example.com"}
+	daemon, err := startDaemon(settings, socketTestDir(t), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+
+	registered, owner, err := sendControl(daemon.socketPath, controlRequest{
+		Token: settings.Token, Type: controlRegister, Subdomain: "proof", Port: serverPort(backend),
+	})
+	if err != nil || !registered.OK {
+		t.Fatalf("register: %+v, %v", registered, err)
+	}
+	if registered.ReadinessPath == "" || registered.ReadinessProof == "" || registered.ReadinessPath == registered.ReadinessProof {
+		t.Fatalf("readiness challenge = %q, proof = %q", registered.ReadinessPath, registered.ReadinessProof)
+	}
+	challenge := strings.TrimPrefix(registered.ReadinessPath, "/.mytunnel/readiness/")
+	if len(challenge) != 32 || len(registered.ReadinessProof) != 32 {
+		t.Fatalf("readiness entropy lengths = %d and %d", len(challenge), len(registered.ReadinessProof))
+	}
+	if _, err := hex.DecodeString(challenge); err != nil {
+		t.Fatalf("challenge encoding: %v", err)
+	}
+	if _, err := hex.DecodeString(registered.ReadinessProof); err != nil {
+		t.Fatalf("proof encoding: %v", err)
+	}
+
+	request := func(method, host, path string) (int, string, http.Header) {
+		req, _ := http.NewRequest(method, fmt.Sprintf("http://127.0.0.1:%d%s", daemon.RouterPort, path), nil)
+		req.Host = host
+		response, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body), response.Header
+	}
+	code, body, headers := request(http.MethodGet, "proof.example.com", registered.ReadinessPath)
+	if code != http.StatusOK || body != registered.ReadinessProof {
+		t.Fatalf("proof response = %d %q", code, body)
+	}
+	if headers.Get("Cache-Control") != "no-store" {
+		t.Fatalf("cache control = %q", headers.Get("Cache-Control"))
+	}
+	if got := backendRequests.Load(); got != 0 {
+		t.Fatalf("backend readiness requests = %d", got)
+	}
+
+	if code, body, _ := request(http.MethodHead, "proof.example.com", registered.ReadinessPath); code != 200 || body != "" {
+		t.Fatalf("ordinary HEAD = %d %q", code, body)
+	}
+	if code, body, _ := request(http.MethodGet, "proof.example.com", "/ordinary"); code != 200 || body != "GET:/ordinary" {
+		t.Fatalf("ordinary GET = %d %q", code, body)
+	}
+	if got := backendRequests.Load(); got != 2 {
+		t.Fatalf("backend ordinary requests = %d", got)
+	}
+	if code, _, _ := request(http.MethodGet, "other.example.com", registered.ReadinessPath); code != http.StatusNotFound {
+		t.Fatalf("other host status = %d", code)
+	}
+
+	owner.Close()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if code, _, _ := request(http.MethodGet, "proof.example.com", registered.ReadinessPath); code == http.StatusNotFound {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expired route instance still served readiness")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	replacement, replacementOwner, err := sendControl(daemon.socketPath, controlRequest{
+		Token: settings.Token, Type: controlRegister, Subdomain: "proof", Port: serverPort(backend),
+	})
+	if err != nil || !replacement.OK {
+		t.Fatalf("replacement register: %+v, %v", replacement, err)
+	}
+	defer replacementOwner.Close()
+	if replacement.ReadinessPath == registered.ReadinessPath || replacement.ReadinessProof == registered.ReadinessProof {
+		t.Fatal("replacement route reused the old readiness challenge")
+	}
+	if code, body, _ := request(http.MethodGet, "proof.example.com", registered.ReadinessPath); code != http.StatusOK || body == registered.ReadinessProof {
+		t.Fatalf("stale readiness response = %d %q", code, body)
+	}
+	if code, body, _ := request(http.MethodGet, "proof.example.com", replacement.ReadinessPath); code != http.StatusOK || body != replacement.ReadinessProof {
+		t.Fatalf("replacement readiness response = %d %q", code, body)
 	}
 }
 

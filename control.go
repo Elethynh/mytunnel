@@ -2,10 +2,10 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"path/filepath"
 	"time"
@@ -16,6 +16,14 @@ type controlRequestType string
 const (
 	controlStatus   controlRequestType = "status"
 	controlRegister controlRequestType = "register"
+	controlObserve  controlRequestType = "observe"
+)
+
+const (
+	capabilityRouteInstances = "route-instances-v1"
+	capabilityReadiness      = "public-readiness-v1"
+	capabilityRequestLogs    = "request-logs-v1"
+	controlFrameLimit        = 4096
 )
 
 type controlRequest struct {
@@ -23,6 +31,7 @@ type controlRequest struct {
 	Type      controlRequestType `json:"type"`
 	Subdomain string             `json:"subdomain,omitempty"`
 	Port      int                `json:"port,omitempty"`
+	RouteID   string             `json:"routeId,omitempty"`
 }
 
 type routeStatus struct {
@@ -31,31 +40,55 @@ type routeStatus struct {
 }
 
 type controlResponse struct {
-	OK     bool          `json:"ok"`
-	Error  string        `json:"error,omitempty"`
-	URL    string        `json:"url,omitempty"`
-	Domain string        `json:"domain,omitempty"`
-	Retry  bool          `json:"retry,omitempty"`
-	Routes []routeStatus `json:"routes,omitempty"`
+	OK             bool          `json:"ok"`
+	Error          string        `json:"error,omitempty"`
+	URL            string        `json:"url,omitempty"`
+	Domain         string        `json:"domain,omitempty"`
+	Retry          bool          `json:"retry,omitempty"`
+	Routes         []routeStatus `json:"routes,omitempty"`
+	Capabilities   []string      `json:"capabilities,omitempty"`
+	RouteID        string        `json:"routeId,omitempty"`
+	ReadinessPath  string        `json:"readinessPath,omitempty"`
+	ReadinessProof string        `json:"readinessProof,omitempty"`
 }
+
+type controlConnection struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *controlConnection) Read(data []byte) (int, error) { return c.reader.Read(data) }
+
+func (c *controlConnection) readFrame() ([]byte, error) { return readControlFrame(c.reader) }
 
 func controlAddress(dir string) string { return filepath.Join(dir, "control.sock") }
 
-func sendControl(address string, request controlRequest) (controlResponse, net.Conn, error) {
-	conn, err := net.DialTimeout("unix", address, time.Second)
+func sendControl(address string, request controlRequest) (controlResponse, *controlConnection, error) {
+	return sendControlContext(context.Background(), address, request)
+}
+
+func sendControlContext(ctx context.Context, address string, request controlRequest) (controlResponse, *controlConnection, error) {
+	dialer := net.Dialer{Timeout: time.Second}
+	conn, err := dialer.DialContext(ctx, "unix", address)
 	if err != nil {
 		return controlResponse{}, nil, err
 	}
+	stream := &controlConnection{Conn: conn, reader: bufio.NewReaderSize(conn, 4096)}
+	stopCancellation := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopCancellation()
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
 		conn.Close()
+		if ctx.Err() != nil {
+			return controlResponse{}, nil, ctx.Err()
+		}
 		return controlResponse{}, nil, err
 	}
-	line, err := bufio.NewReader(io.LimitReader(conn, 4097)).ReadBytes('\n')
-	if err != nil || len(line) > 4096 {
+	line, err := stream.readFrame()
+	if err != nil {
 		conn.Close()
-		if err == nil {
-			err = errors.New("daemon response is too long")
+		if ctx.Err() != nil {
+			return controlResponse{}, nil, ctx.Err()
 		}
 		return controlResponse{}, nil, err
 	}
@@ -65,5 +98,16 @@ func sendControl(address string, request controlRequest) (controlResponse, net.C
 		return controlResponse{}, nil, fmt.Errorf("invalid daemon response: %w", err)
 	}
 	conn.SetDeadline(time.Time{})
-	return response, conn, nil
+	return response, stream, nil
+}
+
+func readControlFrame(reader *bufio.Reader) ([]byte, error) {
+	line, err := reader.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) || len(line) > controlFrameLimit {
+		return nil, errors.New("daemon response is too long")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return line, nil
 }
