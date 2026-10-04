@@ -23,14 +23,23 @@ func main() {
 func run(args []string) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		fmt.Printf(`Usage:
-  mytunnel <port> [--subdomain name]  Expose a local HTTP service
-  mytunnel up [--config path]         Expose all routes in a project file
+  mytunnel <port> [--subdomain name] [--open] [--copy] [--qr] [--logs]
+  mytunnel up [--config path] [--open] [--copy] [--qr] [--logs]
   mytunnel status                    Show active routes
   mytunnel --version                 Show the installed version
   mytunnel configure --domain domain --tunnel UUID --credentials file.json
 
+Startup flags are optional and may be combined:
+  --open  Open local routes immediately and public routes after confirmation
+  --copy  Copy registered URLs once, in route order and separated by newlines
+  --qr    Print a QR for public URLs (localhost URLs are not phone-reachable)
+  --logs  Stream this command's request method, path, status, and duration
+
+Project mode reads .mytunnel.json in the current directory unless --config is set.
+Public confirmation proves HTTPS routing, not application health. A route stays
+active when confirmation times out after 30 seconds.
 Without Cloudflare configuration, routes use <name>.localhost:%d.
-Each command keeps its route active until Ctrl+C.
+Each command keeps its routes active until Ctrl+C.
 `, defaultRouterPort)
 		return nil
 	}

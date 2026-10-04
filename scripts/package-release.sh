@@ -23,9 +23,9 @@ for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
   mkdir -p "$stage"
   CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" "$go_bin" build \
     -trimpath -ldflags "-s -w -X main.version=$release_tag" -o "$stage/mytunnel" .
-  cp LICENSE README.md "$stage/"
+  cp LICENSE README.md THIRD_PARTY_NOTICES.md "$stage/"
   archive="mytunnel_${release_tag#v}_${target_os}_${target_arch}.tar.gz"
-  tar -C "$stage" -czf "$output_dir/$archive" mytunnel LICENSE README.md
+  tar -C "$stage" -czf "$output_dir/$archive" mytunnel LICENSE README.md THIRD_PARTY_NOTICES.md
   printf 'Built %s\n' "$archive"
 done
 
