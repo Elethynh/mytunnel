@@ -1,6 +1,6 @@
 # mytunnel
 
-TLDR: You know ngrok? This is your basic ngrok - free (except for a domain)
+TLDR: You know ngrok? This is your basic ngrok-like CLI - on top of a `cloudflared` tunnel.
 
 ## Basic usage
 
